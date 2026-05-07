@@ -367,6 +367,17 @@ def value_count_table(df: pd.DataFrame, col: str, denominator: int, top_n=10) ->
     return out
 
 
+def display_table(df: pd.DataFrame, drop_sku_row_count: bool = False) -> pd.DataFrame:
+    """Format tables for Streamlit/Excel display without changing internal calculation columns."""
+    out = df.copy()
+    # For Nail Style / Product Link breakdowns, remove the duplicate SKU Row Count column.
+    # Keep Order Count because it shows how many unique cancelled orders are involved.
+    if drop_sku_row_count and "SKU Row Count" in out.columns:
+        out = out.drop(columns=["SKU Row Count"])
+    out = out.rename(columns={"Pct": "占比 %"})
+    return out
+
+
 # =========================
 # HTML rendering helpers
 # =========================
@@ -402,7 +413,6 @@ def make_breakdown_rows(bdf: pd.DataFrame, name_col: str, metric_col: str, color
             <div class="break-name" title="{html.escape(name)}">{html.escape(name)}</div>
             <div class="break-bar-wrap"><div class="break-bar" style="width:{width}%;background:{color}"></div></div>
             <div class="break-num">{fmt_num(r[metric_col])}</div>
-            <div class="break-orders">{fmt_num(r['Order Count'])} orders</div>
             <div class="break-pct">{float(r['Pct']):.1f}%</div>
           </div>
         ''')
@@ -702,9 +712,9 @@ def make_excel_download(all_orders, cancel_orders, cancel_lines, style_breakdown
         all_orders.to_excel(writer, index=False, sheet_name="Order Level All")
         cancel_orders.to_excel(writer, index=False, sheet_name="Cancelled Orders")
         cancel_lines.to_excel(writer, index=False, sheet_name="Cancelled SKU Lines")
-        style_breakdown.to_excel(writer, index=False, sheet_name="Nail Style Breakdown")
-        product_breakdown.to_excel(writer, index=False, sheet_name="Product Link Breakdown")
-        reason_df.to_excel(writer, index=False, sheet_name="Cancel Reasons")
+        display_table(style_breakdown, drop_sku_row_count=True).to_excel(writer, index=False, sheet_name="Nail Style Breakdown")
+        display_table(product_breakdown, drop_sku_row_count=True).to_excel(writer, index=False, sheet_name="Product Link Breakdown")
+        display_table(reason_df).to_excel(writer, index=False, sheet_name="Cancel Reasons")
         pd.DataFrame({
             "Hour": list(range(24)),
             "Cancelled Orders Created Time": ctx["created_hour_counts"],
@@ -917,11 +927,11 @@ st.dataframe(live_summary, use_container_width=True, hide_index=True)
 st.subheader("Breakdowns")
 tab1, tab2, tab3, tab4 = st.tabs(["Cancel Reasons", "甲型 / SKU", "H Column 产品链接", "订单级 Cancelled 明细"])
 with tab1:
-    st.dataframe(reason_df, use_container_width=True, hide_index=True)
+    st.dataframe(display_table(reason_df), use_container_width=True, hide_index=True)
 with tab2:
-    st.dataframe(style_breakdown, use_container_width=True, hide_index=True)
+    st.dataframe(display_table(style_breakdown, drop_sku_row_count=True), use_container_width=True, hide_index=True)
 with tab3:
-    st.dataframe(product_breakdown, use_container_width=True, hide_index=True)
+    st.dataframe(display_table(product_breakdown, drop_sku_row_count=True), use_container_width=True, hide_index=True)
 with tab4:
     st.dataframe(cancel_orders, use_container_width=True, hide_index=True)
 
