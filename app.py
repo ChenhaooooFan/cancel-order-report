@@ -14,7 +14,7 @@ import streamlit.components.v1 as components
 # Page config
 # =========================
 st.set_page_config(
-    page_title="Cancelled + Returned Orders Report Generator",
+    page_title="Cancelled + Returned Orders Report",
     page_icon="💅",
     layout="wide",
 )
