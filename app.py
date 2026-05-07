@@ -1,5 +1,6 @@
 import html
 import json
+import re
 from io import BytesIO
 from datetime import date
 
@@ -13,7 +14,7 @@ import streamlit.components.v1 as components
 # Page config
 # =========================
 st.set_page_config(
-    page_title="Cancelled Orders Report Generator",
+    page_title="Cancelled + Returned Orders Report Generator",
     page_icon="💅",
     layout="wide",
 )
@@ -32,6 +33,23 @@ SIZE_TOKENS = {
     "XS", "S", "M", "L", "XL", "XXL", "XXXL",
     "EXTRA SMALL", "SMALL", "MEDIUM", "LARGE", "EXTRA LARGE",
 }
+
+RETURN_TARGET_PRODUCT_LINKS = [
+    "Dreamwear",
+    "Top Trend",
+    "Next Gen",
+    "New Drop",
+    "Final Sale",
+    "Square",
+    "Stiletto",
+    "Almond",
+    "Spring Bloom",
+    "Summer Shine",
+    "Best Seller",
+    "Organizer Binder",
+    "10 PCs TOOLKITS",
+    "BUY 4 GET 1 FREE NailVesta Handcrafted 3D Press-On Nails | Reusable, Long-Lasting, Salon-Quality",
+]
 
 
 # =========================
@@ -378,6 +396,325 @@ def display_table(df: pd.DataFrame, drop_sku_row_count: bool = False) -> pd.Data
     return out
 
 
+def strip_seller_sku_size_suffix(x) -> str:
+    """H column Seller SKU: remove final size suffix like -S / -M / -L / -XS / -XL."""
+    s = normalize_text(x, default="Unknown")
+    if s == "Unknown":
+        return s
+    s = re.sub(r"\s+", "", s)
+    s = re.sub(r"(?i)([-_\s]+)(XS|S|M|L|XL|XXL|XXXL)$", "", s)
+    return s or "Unknown"
+
+
+def strip_sku_name_size_suffix(x) -> str:
+    """J column SKU Name: style name, remove final size token such as ', S'."""
+    s = normalize_text(x, default="Unknown")
+    if s == "Unknown":
+        return s
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    if len(parts) >= 2 and parts[-1].upper() in SIZE_TOKENS:
+        s = ", ".join(parts[:-1]).strip()
+    s = re.sub(r"(?i)\s*[-_/]\s*(XS|S|M|L|XL|XXL|XXXL)$", "", s).strip()
+    return s or "Unknown"
+
+
+def is_no_longer_needed(reason) -> bool:
+    return normalize_text(reason, default="").strip().lower() == "no longer needed"
+
+
+def is_request_cancelled_status(x) -> bool:
+    s = normalize_text(x, default="").strip().lower()
+    return "request" in s and ("cancelled" in s or "canceled" in s or "cancel" in s)
+
+
+def is_refund_only_type(x) -> bool:
+    s = normalize_text(x, default="").strip().lower().replace("-", " ")
+    return s == "refund only"
+
+
+def display_return_breakdown_table(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out = out.rename(columns={
+        "Pct": "占比 %",
+        "Return Style English (Catalog)": "款式英文名",
+        "Return Product Link (I Product Name)": "退货产品链接",
+        "Product Link": "指定产品链接",
+        "Returned Units": "退货件数",
+        "Return Package Count": "退货包裹数",
+        "SKU Rows": "SKU行数",
+    })
+    return out
+
+
+def build_catalog_sku_name_map(catalog_raw: pd.DataFrame) -> dict:
+    """产品图册：SKU -> 款式英文名称。SKU 会去掉尺码后缀后匹配。"""
+    if catalog_raw is None or catalog_raw.empty:
+        return {}
+    df = catalog_raw.copy()
+    df.columns = [clean_column_name(c) for c in df.columns]
+    if "SKU" not in df.columns or "款式英文名称" not in df.columns:
+        return {}
+    out = {}
+    for _, row in df.iterrows():
+        sku = strip_seller_sku_size_suffix(row.get("SKU", ""))
+        name = normalize_text(row.get("款式英文名称", ""), default="")
+        if sku and sku != "Unknown" and name:
+            out[sku] = name
+    return out
+
+
+def apply_catalog_style_names(return_lines: pd.DataFrame, catalog_map: dict) -> pd.DataFrame:
+    """Use H-column Seller SKU base code to map to catalog English style name; fallback to J-column SKU Name."""
+    df = return_lines.copy()
+    if df.empty:
+        df["Return Style English (Catalog)"] = []
+        return df
+    if not catalog_map:
+        df["Return Style English (Catalog)"] = df.get("Return Style (J SKU Name)", pd.Series(["Unknown"] * len(df), index=df.index))
+        return df
+    df["Return Style English (Catalog)"] = df["Return SKU (H no size)"].map(catalog_map)
+    fallback = df.get("Return Style (J SKU Name)", pd.Series(["Unknown"] * len(df), index=df.index))
+    df["Return Style English (Catalog)"] = df["Return Style English (Catalog)"].fillna(fallback)
+    df["Return Style English (Catalog)"] = df["Return Style English (Catalog)"].apply(lambda x: normalize_text(x, default="Unknown"))
+    return df
+
+
+def make_return_specific_product_link_share(lines: pd.DataFrame, target_links=None) -> pd.DataFrame:
+    """For specified product links/collections, calculate return share against total returned units."""
+    if target_links is None:
+        target_links = RETURN_TARGET_PRODUCT_LINKS
+    if lines.empty or "Return Product Link (I Product Name)" not in lines.columns:
+        return pd.DataFrame(columns=["Product Link", "Returned Units", "Return Package Count", "SKU Rows", "Pct"])
+    total_units = lines["Return Quantity Parsed"].sum()
+    product_lower = lines["Return Product Link (I Product Name)"].fillna("").astype(str).str.lower()
+    rows = []
+    for label in target_links:
+        label_lower = str(label).lower()
+        mask = product_lower.str.contains(re.escape(label_lower), na=False, regex=True)
+        sub = lines[mask]
+        units = float(sub["Return Quantity Parsed"].sum()) if not sub.empty else 0
+        pkg_count = int(sub["Return Package Key"].nunique()) if not sub.empty else 0
+        sku_rows = int(sub["Returned SKU Row Count"].sum()) if not sub.empty else 0
+        rows.append([label, units, pkg_count, sku_rows, pct(units, total_units)])
+    return pd.DataFrame(rows, columns=["Product Link", "Returned Units", "Return Package Count", "SKU Rows", "Pct"])
+
+
+# =========================
+# Returned order / package helpers
+# =========================
+def choose_return_package_key(row) -> str:
+    """One returned package = tracking number when available; fallback to return order/order id."""
+    tracking = normalize_text(row.get("Return Logistics Tracking ID", ""), default="")
+    return_order_id = normalize_text(row.get("Return Order ID", ""), default="")
+    order_id = normalize_text(row.get("Order ID", ""), default="")
+    if tracking:
+        return f"TRACKING：{tracking}"
+    if return_order_id:
+        return f"RETURN_ORDER：{return_order_id}"
+    if order_id:
+        return f"ORDER：{order_id}"
+    return "UNKNOWN_PACKAGE"
+
+
+def prepare_return_line_level(return_raw: pd.DataFrame, all_order_lookup: pd.DataFrame,
+                              live1_start, live1_end, live2_start, live2_end) -> pd.DataFrame:
+    """
+    Returned Order file is all considered returned. It is SKU-line level.
+    Created Time is pulled by matching Order ID back to the uploaded all-order table.
+    """
+    df = return_raw.copy()
+    df.columns = [clean_column_name(c) for c in df.columns]
+    if "Order ID" not in df.columns:
+        raise ValueError("Returned Order 表缺少必要字段：Order ID")
+
+    df["Order ID"] = df["Order ID"].apply(stringify_id)
+    df = df[df["Order ID"] != ""].copy()
+    if df.empty:
+        return df
+
+    needed_cols = [
+        "Return Order ID", "Return Logistics Tracking ID", "Return Reason", "Return Type",
+        "Return Status", "Return Sub Status", "Product Name", "SKU Name", "Seller SKU",
+        "Buyer Username", "Buyer Note"
+    ]
+    for c in needed_cols:
+        if c not in df.columns:
+            df[c] = ""
+        df[c] = df[c].apply(lambda x: normalize_text(x, default=""))
+
+    if "Return Quantity" in df.columns:
+        rq = parse_number_series(df["Return Quantity"], default=np.nan).fillna(1)
+        rq = rq.where(rq > 0, 1)
+    else:
+        rq = pd.Series([1] * len(df), index=df.index)
+    df["Return Quantity Parsed"] = rq
+    df["Returned SKU Row Count"] = 1
+    df["Return Package Key"] = df.apply(choose_return_package_key, axis=1)
+
+    # H column = Seller SKU, ignore size suffix; J column = SKU Name;
+    # N = Return Reason; S = Return Sub Status; Q = Return Logistics Tracking ID; L = Return Type.
+    df["Return SKU (H no size)"] = df["Seller SKU"].apply(strip_seller_sku_size_suffix)
+    df["Return Style (J SKU Name)"] = df["SKU Name"].apply(strip_sku_name_size_suffix)
+    df["Return Style English (Catalog)"] = df["Return Style (J SKU Name)"]
+    df["Return Product Link (I Product Name)"] = df["Product Name"].apply(lambda x: normalize_text(x, default="Unknown"))
+    df["Return Reason Clean"] = df["Return Reason"].apply(lambda x: normalize_text(x, default="Unknown"))
+    df["Return Type Clean"] = df["Return Type"].apply(lambda x: normalize_text(x, default="Unknown"))
+    df["Return Sub Status Clean"] = df["Return Sub Status"].apply(lambda x: normalize_text(x, default="Unknown"))
+    df["Seller Fault Flag"] = ~df["Return Reason Clean"].apply(is_no_longer_needed)
+    df["Return Reason Attribution"] = np.where(df["Seller Fault Flag"], "Seller Fault", "No Longer Needed")
+    df["Request Cancelled Flag"] = df["Return Sub Status Clean"].apply(is_request_cancelled_status)
+    df["Has Return Tracking Flag"] = df["Return Logistics Tracking ID"].apply(lambda x: bool(normalize_text(x, default="")))
+    df["Refund Only Flag"] = df["Return Type Clean"].apply(is_refund_only_type)
+
+    if "Created Time" in df.columns:
+        df["Created Datetime From Return File"] = parse_datetime_series(df["Created Time"])
+    else:
+        df["Created Datetime From Return File"] = pd.NaT
+
+    lookup = all_order_lookup[["Order ID", "Created Datetime"]].drop_duplicates("Order ID").copy()
+    df = df.merge(lookup, on="Order ID", how="left")
+    df["Created Datetime"] = df["Created Datetime"].fillna(df["Created Datetime From Return File"])
+    df["Created Hour"] = df["Created Datetime"].dt.hour
+    df["Live Segment by Created Time"] = df["Created Hour"].apply(
+        lambda h: classify_live_segment(h, live1_start, live1_end, live2_start, live2_end)
+    )
+    df.loc[df["Created Datetime"].isna(), "Live Segment by Created Time"] = "Unknown"
+    df["Is Live by Created Time"] = df["Live Segment by Created Time"].isin(["直播①", "直播②"])
+    return df
+
+def build_return_package_level(return_lines: pd.DataFrame) -> pd.DataFrame:
+    if return_lines.empty:
+        return pd.DataFrame()
+    tmp = return_lines.copy()
+    tmp["Seller Fault Int"] = tmp["Seller Fault Flag"].astype(int)
+    tmp["Request Cancelled Int"] = tmp["Request Cancelled Flag"].astype(int)
+    tmp["Has Return Tracking Int"] = tmp["Has Return Tracking Flag"].astype(int)
+    tmp["Refund Only Int"] = tmp["Refund Only Flag"].astype(int)
+
+    pkg = (
+        tmp.groupby("Return Package Key", as_index=False)
+        .agg(
+            **{
+                "Order IDs": ("Order ID", join_unique),
+                "Return Order IDs": ("Return Order ID", join_unique),
+                "Return Logistics Tracking ID": ("Return Logistics Tracking ID", mode_or_first),
+                "Created Datetime": ("Created Datetime", first_non_null),
+                "Return Reason": ("Return Reason Clean", mode_or_first),
+                "Return Type": ("Return Type Clean", mode_or_first),
+                "Return Status": ("Return Status", mode_or_first),
+                "Return Sub Status": ("Return Sub Status Clean", mode_or_first),
+                "Returned SKU Rows": ("Returned SKU Row Count", "sum"),
+                "Return Quantity": ("Return Quantity Parsed", "sum"),
+                "Product Names": ("Product Name", join_unique),
+                "Return Product Links I": ("Return Product Link (I Product Name)", join_unique),
+                "Return SKUs H no size": ("Return SKU (H no size)", join_unique),
+                "Return Style English Catalog": ("Return Style English (Catalog)", join_unique),
+                "Return Styles J SKU Name": ("Return Style (J SKU Name)", join_unique),
+                "Seller SKUs Raw": ("Seller SKU", join_unique),
+                "SKU Names Raw": ("SKU Name", join_unique),
+                "Seller Fault Int": ("Seller Fault Int", "max"),
+                "Request Cancelled Int": ("Request Cancelled Int", "max"),
+                "Has Return Tracking Int": ("Has Return Tracking Int", "max"),
+                "Refund Only Int": ("Refund Only Int", "max"),
+            }
+        )
+    )
+    pkg["Seller Fault Flag"] = pkg["Seller Fault Int"].eq(1)
+    pkg["Return Reason Attribution"] = np.where(pkg["Seller Fault Flag"], "Seller Fault", "No Longer Needed")
+    pkg["Request Cancelled Flag"] = pkg["Request Cancelled Int"].eq(1)
+    pkg["Has Return Tracking Flag"] = pkg["Has Return Tracking Int"].eq(1)
+    pkg["Refund Only Flag"] = pkg["Refund Only Int"].eq(1)
+    pkg = pkg.drop(columns=["Seller Fault Int", "Request Cancelled Int", "Has Return Tracking Int", "Refund Only Int"])
+    return pkg
+
+def finalize_return_package_segments(pkg: pd.DataFrame, live1_start, live1_end, live2_start, live2_end) -> pd.DataFrame:
+    if pkg.empty:
+        return pkg
+    pkg = pkg.copy()
+    pkg["Created Hour"] = pkg["Created Datetime"].dt.hour
+    pkg["Live Segment by Created Time"] = pkg["Created Hour"].apply(
+        lambda h: classify_live_segment(h, live1_start, live1_end, live2_start, live2_end)
+    )
+    pkg.loc[pkg["Created Datetime"].isna(), "Live Segment by Created Time"] = "Unknown"
+    pkg["Is Live by Created Time"] = pkg["Live Segment by Created Time"].isin(["直播①", "直播②"])
+    return pkg
+
+
+def make_return_segment_summary(return_packages: pd.DataFrame) -> pd.DataFrame:
+    total = len(return_packages)
+    rows = []
+    for seg in ["直播①", "直播②", "直播合计", "非直播", "Unknown"]:
+        if seg == "直播合计":
+            count = int(return_packages["Live Segment by Created Time"].isin(["直播①", "直播②"]).sum()) if total else 0
+        else:
+            count = int((return_packages["Live Segment by Created Time"] == seg).sum()) if total else 0
+        rows.append([seg, count, pct(count, total)])
+    return pd.DataFrame(rows, columns=["Segment", "Returned Packages", "占比 %"])
+
+
+def make_return_line_breakdown(lines: pd.DataFrame, group_col: str, top_n: int) -> pd.DataFrame:
+    if lines.empty or group_col not in lines.columns:
+        return pd.DataFrame(columns=[group_col, "Returned Units", "Return Package Count", "SKU Rows", "Pct"])
+    total_units = lines["Return Quantity Parsed"].sum()
+    out = (
+        lines.groupby(group_col, dropna=False)
+        .agg(
+            **{
+                "Returned Units": ("Return Quantity Parsed", "sum"),
+                "Return Package Count": ("Return Package Key", "nunique"),
+                "SKU Rows": ("Returned SKU Row Count", "sum"),
+            }
+        )
+        .reset_index()
+    )
+    out[group_col] = out[group_col].apply(lambda x: normalize_text(x, default="Unknown"))
+    out["Pct"] = out["Returned Units"].apply(lambda x: pct(x, total_units))
+    out = out.sort_values(["Returned Units", "Return Package Count"], ascending=[False, False]).head(top_n).reset_index(drop=True)
+    return out
+
+
+def make_return_package_count_table(pkg: pd.DataFrame, col: str, top_n=10) -> pd.DataFrame:
+    if pkg.empty or col not in pkg.columns:
+        return pd.DataFrame(columns=[col, "Returned Packages", "Pct"])
+    total = len(pkg)
+    out = pkg[col].fillna("Unknown").astype(str).str.strip().replace({"": "Unknown"}).value_counts().head(top_n).reset_index()
+    out.columns = [col, "Returned Packages"]
+    out["Pct"] = out["Returned Packages"].apply(lambda x: pct(x, total))
+    return out
+
+
+def make_return_boolean_summary(return_packages: pd.DataFrame) -> pd.DataFrame:
+    total = len(return_packages)
+    rows = [
+        ["Seller Fault", int(return_packages["Seller Fault Flag"].sum()) if total else 0, "Return Reason 不是 No Longer Needed"],
+        ["Request Cancelled", int(return_packages["Request Cancelled Flag"].sum()) if total else 0, "S column Return Sub Status"],
+        ["已寄出退回包裹", int(return_packages["Has Return Tracking Flag"].sum()) if total else 0, "Q column Return Logistics Tracking ID 有记录"],
+        ["Refund Only", int(return_packages["Refund Only Flag"].sum()) if total else 0, "L column Return Type = Refund Only"],
+    ]
+    out = pd.DataFrame(rows, columns=["Metric", "Returned Packages", "Definition"])
+    out["占比 %"] = out["Returned Packages"].apply(lambda x: pct(x, total))
+    return out
+
+
+def make_return_segment_rows(return_summary: pd.DataFrame, color="var(--purple)"):
+    if return_summary is None or return_summary.empty:
+        return '<div class="empty-note">暂无 returned package 数据</div>'
+    max_count = return_summary["Returned Packages"].max()
+    rows = []
+    for _, r in return_summary.iterrows():
+        name = str(r["Segment"])
+        width = pct(r["Returned Packages"], max_count, 0) if max_count else 0
+        rows.append(f'''
+          <div class="break-row">
+            <div class="break-name" title="{html.escape(name)}">{html.escape(name)}</div>
+            <div class="break-bar-wrap"><div class="break-bar" style="width:{width}%;background:{color}"></div></div>
+            <div class="break-num">{fmt_num(r['Returned Packages'])}</div>
+            <div class="break-pct">{float(r['占比 %']):.1f}%</div>
+          </div>
+        ''')
+    return "\n".join(rows)
+
+
 # =========================
 # HTML rendering helpers
 # =========================
@@ -512,6 +849,86 @@ def build_html_report(ctx):
         for i, txt in enumerate(ctx["insights"], start=1)
     )
 
+
+    if ctx.get("has_return_data"):
+        return_section_html = f'''
+  <div class="section">
+    <div class="section-label"><span>07</span>Returned 包裹直播归因 · Based on Order Created Time</div>
+    <div class="stat-grid">
+      <div class="stat green"><div class="stat-lbl">Returned Packages</div><div class="stat-val green">{fmt_num(ctx['return_total_packages'])}</div><div class="stat-sub">按 Tracking / Return Order ID 去重</div></div>
+      <div class="stat purple"><div class="stat-lbl">直播时间 Created</div><div class="stat-val purple">{fmt_num(ctx['return_live_packages'])}</div><div class="stat-sub">占 returned packages {fmt_pct(ctx['return_live_packages'], ctx['return_total_packages'])}</div></div>
+      <div class="stat blue"><div class="stat-lbl">非直播 Created</div><div class="stat-val blue">{fmt_num(ctx['return_nonlive_packages'])}</div><div class="stat-sub">Created Time 不在直播时段</div></div>
+      <div class="stat amber"><div class="stat-lbl">Created Time Unknown</div><div class="stat-val amber">{fmt_num(ctx['return_unknown_packages'])}</div><div class="stat-sub">未能从订单总表匹配</div></div>
+    </div>
+    <div class="full-panel" style="margin-top:16px">
+      <div class="panel-title">Returned package segment breakdown <span class="badge y">Return 表全部视作 returned</span></div>
+      {make_return_segment_rows(ctx.get('return_segment_summary'), 'var(--purple)')}
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-label"><span>08</span>Returned Orders · 核心指标</div>
+    <div class="stat-grid">
+      <div class="stat red"><div class="stat-lbl">Seller Fault</div><div class="stat-val red">{fmt_num(ctx['return_seller_fault_packages'])}</div><div class="stat-sub">Return Reason ≠ No Longer Needed · {fmt_pct(ctx['return_seller_fault_packages'], ctx['return_total_packages'])}</div></div>
+      <div class="stat amber"><div class="stat-lbl">Request Cancelled</div><div class="stat-val amber">{fmt_num(ctx['return_request_cancelled_packages'])}</div><div class="stat-sub">S column · {fmt_pct(ctx['return_request_cancelled_packages'], ctx['return_total_packages'])}</div></div>
+      <div class="stat green"><div class="stat-lbl">已寄出退回包裹</div><div class="stat-val green">{fmt_num(ctx['return_shipped_packages'])}</div><div class="stat-sub">Q column tracking 有记录 · {fmt_pct(ctx['return_shipped_packages'], ctx['return_total_packages'])}</div></div>
+      <div class="stat blue"><div class="stat-lbl">Refund Only</div><div class="stat-val blue">{fmt_num(ctx['return_refund_only_packages'])}</div><div class="stat-sub">L column Return Type · {fmt_pct(ctx['return_refund_only_packages'], ctx['return_total_packages'])}</div></div>
+    </div>
+    <div class="two-col" style="margin-top:16px">
+      <div class="panel">
+        <div class="panel-title">Return Reason 占比 <span class="badge r">N column</span></div>
+        {make_reason_rows(ctx.get('return_reason_df').rename(columns={'Returned Packages':'Order Count'}), 'var(--live1)')}
+      </div>
+      <div class="panel">
+        <div class="panel-title">Seller Fault 归因 <span class="badge y">非 No Longer Needed</span></div>
+        {make_reason_rows(ctx.get('return_fault_df').rename(columns={'Returned Packages':'Order Count'}), 'var(--live2)')}
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-label"><span>09</span>Returned Orders · SKU / 款式 Breakdown</div>
+    <div class="two-col">
+      <div class="panel">
+        <div class="panel-title">退货 SKU Top10 <span class="badge b">H column Seller SKU → 产品图册款式英文名</span></div>
+        {make_breakdown_rows(ctx['return_sku_breakdown'], 'Return Style English (Catalog)', 'Returned Units', 'var(--nonlive)')}
+      </div>
+      <div class="panel">
+        <div class="panel-title">退货款式 <span class="badge r">J column SKU Name</span></div>
+        {make_breakdown_rows(ctx['return_style_breakdown'], 'Return Style (J SKU Name)', 'Returned Units', 'var(--live1)')}
+      </div>
+    </div>
+    <div class="two-col" style="margin-top:16px">
+      <div class="panel">
+        <div class="panel-title">Return Type <span class="badge y">L column</span></div>
+        {make_reason_rows(ctx.get('return_type_df').rename(columns={'Returned Packages':'Order Count'}), 'var(--live2)')}
+      </div>
+      <div class="panel">
+        <div class="panel-title">Return Sub Status <span class="badge b">S column</span></div>
+        {make_reason_rows(ctx.get('return_status_df').rename(columns={'Returned Packages':'Order Count'}), 'var(--nonlive)')}
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-label"><span>10</span>Returned Orders · 产品链接 Breakdown</div>
+    <div class="two-col">
+      <div class="panel">
+        <div class="panel-title">Top5 高退货产品链接 <span class="badge b">I column Product Name</span></div>
+        {make_breakdown_rows(ctx['return_product_link_top5'], 'Return Product Link (I Product Name)', 'Returned Units', 'var(--nonlive)')}
+      </div>
+      <div class="panel">
+        <div class="panel-title">指定产品链接退货占比 <span class="badge r">按 Return Quantity</span></div>
+        {make_breakdown_rows(ctx['return_product_link_targets'], 'Product Link', 'Returned Units', 'var(--live1)')}
+      </div>
+    </div>
+  </div>
+'''
+        insight_section_no = "11"
+    else:
+        return_section_html = ""
+        insight_section_no = "07"
+
     html_doc = f'''<!DOCTYPE html>
 <html lang="zh">
 <head>
@@ -582,8 +999,8 @@ def build_html_report(ctx):
 <body>
 <header>
   <div class="header-tag">Cancel Order Analytics · {html.escape(ctx['range_label'])}</div>
-  <h1>取消订单<br>分析报告</h1>
-  <p class="header-sub">订单总表清洗 · Order ID 去重 · Created Time 直播归因 · SKU/甲型与产品链接拆解</p>
+  <h1>Cancelled + Returned<br>订单分析报告</h1>
+  <p class="header-sub">订单总表清洗 · Cancelled + Returned · Created Time 直播归因 · SKU/款式/原因拆解</p>
   <div class="header-meta">
     <strong>{fmt_num(ctx['cancel_orders'])}</strong>
     Cancelled Orders<br>
@@ -651,8 +1068,10 @@ def build_html_report(ctx):
     </div>
   </div>
 
+  {return_section_html}
+
   <div class="section">
-    <div class="section-label"><span>07</span>关键洞察 Key Insights</div>
+    <div class="section-label"><span>{insight_section_no}</span>关键洞察 Key Insights</div>
     <div class="insights">{insights_html}</div>
   </div>
 </main>
@@ -696,7 +1115,7 @@ new C(document.getElementById('cancelledHour'), {{
 def make_excel_download(all_orders, cancel_orders, cancel_lines, style_breakdown, product_breakdown, reason_df, ctx) -> bytes:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        summary = pd.DataFrame([
+        summary_rows = [
             ["Date Range", ctx["range_label"]],
             ["Total Orders", ctx["total_orders"]],
             ["Cancelled Orders", ctx["cancel_orders"]],
@@ -707,7 +1126,17 @@ def make_excel_download(all_orders, cancel_orders, cancel_lines, style_breakdown
             ["Non-live Cancelled by Created Time", ctx["nonlive_cancel"]],
             ["Live Created Order Cancel Rate", f"{ctx['live_cancel_rate']:.1f}%"],
             ["Non-live Created Order Cancel Rate", f"{ctx['nonlive_cancel_rate']:.1f}%"],
-        ], columns=["Metric", "Value"])
+        ]
+        if ctx.get("has_return_data"):
+            summary_rows.extend([
+                ["Returned Order Source", ctx.get("return_file_name", "")],
+                ["Returned Packages", ctx.get("return_total_packages", 0)],
+                ["Returned Packages Created in Live Time", ctx.get("return_live_packages", 0)],
+                ["Returned Live Created Package %", fmt_pct(ctx.get("return_live_packages", 0), ctx.get("return_total_packages", 0))],
+                ["Returned Packages Created in Non-live Time", ctx.get("return_nonlive_packages", 0)],
+                ["Returned Packages Unknown Created Time", ctx.get("return_unknown_packages", 0)],
+            ])
+        summary = pd.DataFrame(summary_rows, columns=["Metric", "Value"])
         summary.to_excel(writer, index=False, sheet_name="Summary")
         all_orders.to_excel(writer, index=False, sheet_name="Order Level All")
         cancel_orders.to_excel(writer, index=False, sheet_name="Cancelled Orders")
@@ -720,6 +1149,18 @@ def make_excel_download(all_orders, cancel_orders, cancel_lines, style_breakdown
             "Cancelled Orders Created Time": ctx["created_hour_counts"],
             "Cancelled Orders Cancelled Time": ctx["cancelled_hour_counts"],
         }).to_excel(writer, index=False, sheet_name="Hourly")
+        if ctx.get("has_return_data"):
+            ctx.get("return_boolean_summary", pd.DataFrame()).to_excel(writer, index=False, sheet_name="Returned KPI Summary")
+            display_return_breakdown_table(ctx.get("return_reason_df", pd.DataFrame())).to_excel(writer, index=False, sheet_name="Return Reasons")
+            display_return_breakdown_table(ctx.get("return_sku_breakdown", pd.DataFrame())).to_excel(writer, index=False, sheet_name="Return SKU Top10")
+            display_return_breakdown_table(ctx.get("return_style_breakdown", pd.DataFrame())).to_excel(writer, index=False, sheet_name="Return Style J")
+            display_return_breakdown_table(ctx.get("return_product_link_top5", pd.DataFrame())).to_excel(writer, index=False, sheet_name="Return Product Top5")
+            display_return_breakdown_table(ctx.get("return_product_link_targets", pd.DataFrame())).to_excel(writer, index=False, sheet_name="Return Product Targets")
+            display_return_breakdown_table(ctx.get("return_type_df", pd.DataFrame())).to_excel(writer, index=False, sheet_name="Return Type")
+            display_return_breakdown_table(ctx.get("return_status_df", pd.DataFrame())).to_excel(writer, index=False, sheet_name="Return Sub Status")
+            ctx.get("return_segment_summary", pd.DataFrame()).to_excel(writer, index=False, sheet_name="Returned Segment")
+            ctx.get("return_packages_df", pd.DataFrame()).to_excel(writer, index=False, sheet_name="Returned Packages")
+            ctx.get("return_lines_df", pd.DataFrame()).to_excel(writer, index=False, sheet_name="Returned SKU Lines")
 
         workbook = writer.book
         header_fmt = workbook.add_format({"bold": True, "bg_color": "#F3F4F6", "border": 1})
@@ -734,8 +1175,8 @@ def make_excel_download(all_orders, cancel_orders, cancel_lines, style_breakdown
 # =========================
 # Streamlit UI
 # =========================
-st.title("💅 Cancelled Orders Report Generator")
-st.caption("上传 TikTok Shop 订单总表，程序会自动清洗出 B column `Order Status = Cancelled/Canceled` 的订单，并按 Order ID 去重生成报告。")
+st.title("💅 Cancelled + Returned Orders Report Generator")
+st.caption("上传 TikTok Shop 订单总表，程序会自动清洗 Cancelled Orders；可额外上传 Returned Order 表，生成 Cancelled + Returned 综合分析。")
 
 with st.expander("这版程序的核心口径", expanded=True):
     st.markdown(
@@ -746,10 +1187,23 @@ with st.expander("这版程序的核心口径", expanded=True):
 - **直播归因**：使用 **AB column `Created Time`** 判断是否属于直播间购买，而不是 `Cancelled Time`。
 - **取消峰值**：使用 `Cancelled Time` 单独分析“顾客什么时候取消”，但它不用于直播归因。
 - **甲型 / 产品链接拆解**：基于 cancelled orders 对应的 SKU 行做统计，因为一个订单可能有多个 SKU。
+- **Returned 包裹直播归因**：可额外上传 Returned Order 表；该表不看 Order Status，全部视作 returned，并通过 Order ID 回匹配订单总表里的 Created Time。
+- **Returned 额外指标**：H column Seller SKU 去掉 `-S/-M/-L` 后通过产品图册匹配款式英文名；J column `SKU Name` 统计退货款式；I column `Product Name` 统计退货产品链接；N column `Return Reason` 统计原因；非 `No longer needed` 全部归为 Seller Fault；S/Q/L column 分别统计 Request Cancelled、已寄出退回包裹、Refund Only。
+- **Returned SKU Top10**：只展示产品图册里的款式英文名，不展示 SKU 编码。
         """
     )
 
-uploaded_file = st.file_uploader("上传订单总表 CSV / Excel", type=["csv", "xlsx", "xls"])
+uploaded_file = st.file_uploader("上传订单总表 CSV / Excel", type=["csv", "xlsx", "xls"], key="all_order_file")
+returned_file = st.file_uploader(
+    "可选：上传 Returned Order 表 CSV / Excel（上传后全部视作 returned，不看 Order Status）",
+    type=["csv", "xlsx", "xls"],
+    key="returned_order_file",
+)
+product_catalog_file = st.file_uploader(
+    "可选：上传产品图册 CSV / Excel（用于把退货 H column Seller SKU 匹配成款式英文名）",
+    type=["csv", "xlsx", "xls"],
+    key="product_catalog_file",
+)
 
 if uploaded_file is None:
     st.info("请先上传 TikTok Shop 导出的订单总表。")
@@ -855,6 +1309,70 @@ nonlive_cancel_rate = pct(nonlive_cancel, nonlive_all)
 cancel_sku_metric = float(cancel_lines["Metric Units"].sum()) if not cancel_lines.empty else 0
 missing_cancelled_time = int(cancel_orders["Cancelled Datetime"].isna().sum()) if not cancel_orders.empty else 0
 
+# Optional Returned Order package analysis.
+# The returned file itself is SKU-line level and all rows are treated as returned.
+# Created Time is matched back from the uploaded all-order table by Order ID.
+has_return_data = False
+return_lines_df = pd.DataFrame()
+return_packages_df = pd.DataFrame()
+return_segment_summary = pd.DataFrame()
+return_reason_df = pd.DataFrame()
+return_sku_breakdown = pd.DataFrame()
+return_style_breakdown = pd.DataFrame()
+return_product_link_top5 = pd.DataFrame()
+return_product_link_targets = pd.DataFrame()
+return_type_df = pd.DataFrame()
+return_status_df = pd.DataFrame()
+return_fault_df = pd.DataFrame()
+return_boolean_summary = pd.DataFrame()
+return_total_packages = return_live_packages = return_nonlive_packages = return_unknown_packages = 0
+return_seller_fault_packages = return_request_cancelled_packages = return_shipped_packages = return_refund_only_packages = 0
+return_file_name = ""
+
+if returned_file is not None:
+    try:
+        return_raw = read_uploaded_file(returned_file)
+        return_file_name = returned_file.name
+        catalog_map = {}
+        if product_catalog_file is not None:
+            catalog_raw = read_uploaded_file(product_catalog_file)
+            catalog_map = build_catalog_sku_name_map(catalog_raw)
+            if not catalog_map:
+                st.warning("产品图册未识别到 `SKU` 和 `款式英文名称` 两列；退货 SKU Top10 将使用 J column SKU Name 兜底显示。")
+        # Use the full all-order file for lookup so returned packages can still match even if
+        # the current report date filter is narrower than the uploaded order total table.
+        all_orders_lookup_full = build_order_level(lines, live1_start, live1_end, live2_start, live2_end)
+        return_lines_df = prepare_return_line_level(
+            return_raw, all_orders_lookup_full, live1_start, live1_end, live2_start, live2_end
+        )
+        return_lines_df = apply_catalog_style_names(return_lines_df, catalog_map)
+        return_packages_df = finalize_return_package_segments(
+            build_return_package_level(return_lines_df), live1_start, live1_end, live2_start, live2_end
+        )
+        return_segment_summary = make_return_segment_summary(return_packages_df)
+        return_total_packages = len(return_packages_df)
+        return_live_packages = int(return_packages_df["Is Live by Created Time"].sum()) if return_total_packages else 0
+        return_unknown_packages = int((return_packages_df["Live Segment by Created Time"] == "Unknown").sum()) if return_total_packages else 0
+        return_nonlive_packages = return_total_packages - return_live_packages - return_unknown_packages
+
+        return_reason_df = make_return_package_count_table(return_packages_df, "Return Reason", top_n=top_n)
+        return_fault_df = make_return_package_count_table(return_packages_df, "Return Reason Attribution", top_n=top_n)
+        return_type_df = make_return_package_count_table(return_packages_df, "Return Type", top_n=top_n)
+        return_status_df = make_return_package_count_table(return_packages_df, "Return Sub Status", top_n=top_n)
+        return_sku_breakdown = make_return_line_breakdown(return_lines_df, "Return Style English (Catalog)", top_n=10)
+        return_style_breakdown = make_return_line_breakdown(return_lines_df, "Return Style (J SKU Name)", top_n=top_n)
+        return_product_link_top5 = make_return_line_breakdown(return_lines_df, "Return Product Link (I Product Name)", top_n=5)
+        return_product_link_targets = make_return_specific_product_link_share(return_lines_df)
+        return_boolean_summary = make_return_boolean_summary(return_packages_df)
+
+        return_seller_fault_packages = int(return_packages_df["Seller Fault Flag"].sum()) if return_total_packages else 0
+        return_request_cancelled_packages = int(return_packages_df["Request Cancelled Flag"].sum()) if return_total_packages else 0
+        return_shipped_packages = int(return_packages_df["Has Return Tracking Flag"].sum()) if return_total_packages else 0
+        return_refund_only_packages = int(return_packages_df["Refund Only Flag"].sum()) if return_total_packages else 0
+        has_return_data = True
+    except Exception as e:
+        st.error(f"Returned Order 表读取/分析失败：{e}")
+
 range_label = f"{start_date.strftime('%Y/%m/%d')}–{end_date.strftime('%Y/%m/%d')}"
 ctx = {
     "source_name": uploaded_file.name,
@@ -892,11 +1410,51 @@ ctx = {
     "reason_df": reason_df,
     "style_breakdown": style_breakdown,
     "product_breakdown": product_breakdown,
+    "has_return_data": has_return_data,
+    "return_file_name": return_file_name,
+    "return_total_packages": return_total_packages,
+    "return_live_packages": return_live_packages,
+    "return_nonlive_packages": return_nonlive_packages,
+    "return_unknown_packages": return_unknown_packages,
+    "return_segment_summary": return_segment_summary,
+    "return_reason_df": return_reason_df,
+    "return_sku_breakdown": return_sku_breakdown,
+    "return_style_breakdown": return_style_breakdown,
+    "return_product_link_top5": return_product_link_top5,
+    "return_product_link_targets": return_product_link_targets,
+    "return_type_df": return_type_df,
+    "return_status_df": return_status_df,
+    "return_fault_df": return_fault_df,
+    "return_boolean_summary": return_boolean_summary,
+    "return_seller_fault_packages": return_seller_fault_packages,
+    "return_request_cancelled_packages": return_request_cancelled_packages,
+    "return_shipped_packages": return_shipped_packages,
+    "return_refund_only_packages": return_refund_only_packages,
+    "return_packages_df": return_packages_df,
+    "return_lines_df": return_lines_df,
 }
 ctx["insights"] = build_insights(
     all_orders, cancel_orders, cancel_lines, style_breakdown, product_breakdown,
     start_date, end_date, live1_start, live1_end, live2_start, live2_end,
 )
+if has_return_data:
+    ctx["insights"].append(
+        f"Returned Order 表内共识别 <strong>{fmt_num(return_total_packages)}</strong> 个 returned package，其中原订单 Created Time 落在直播时段的包裹为 <strong>{fmt_num(return_live_packages)}</strong> 个，占 <strong>{fmt_pct(return_live_packages, return_total_packages)}</strong>。该口径不看 Return 表的 Order Status，Return 表上传的行全部视作 returned。"
+    )
+    ctx["insights"].append(
+        f"Returned packages 中，Seller Fault 口径为 Return Reason 不是 No Longer Needed；当前 Seller Fault 包裹 <strong>{fmt_num(return_seller_fault_packages)}</strong> 个，占 <strong>{fmt_pct(return_seller_fault_packages, return_total_packages)}</strong>。Request Cancelled 为 <strong>{fmt_num(return_request_cancelled_packages)}</strong> 个，占 {fmt_pct(return_request_cancelled_packages, return_total_packages)}；已寄出退回包裹为 <strong>{fmt_num(return_shipped_packages)}</strong> 个，占 {fmt_pct(return_shipped_packages, return_total_packages)}；Refund Only 为 <strong>{fmt_num(return_refund_only_packages)}</strong> 个，占 {fmt_pct(return_refund_only_packages, return_total_packages)}。"
+    )
+    if not return_product_link_top5.empty:
+        top_return_product = str(return_product_link_top5.iloc[0]["Return Product Link (I Product Name)"])
+        top_return_product_pct = float(return_product_link_top5.iloc[0]["Pct"])
+        ctx["insights"].append(
+            f"Returned Orders 的 I column 产品链接中，Top1 高退货链接为 <strong>{html.escape(top_return_product)}</strong>，按 Return Quantity 占 returned units 的 <strong>{top_return_product_pct:.1f}%</strong>。建议和该链接对应的直播话术、尺码展示、PDP 图片预期一起复盘。"
+        )
+
+    if return_unknown_packages:
+        ctx["insights"].append(
+            f"有 <strong>{fmt_num(return_unknown_packages)}</strong> 个 returned package 未能通过 Order ID 在订单总表中匹配到 Created Time，因此暂列为 Unknown。建议确认订单总表和 Return 表是否为同一日期范围，或总表是否包含这些 Order ID。"
+        )
 
 html_report = build_html_report(ctx)
 excel_bytes = make_excel_download(all_orders, cancel_orders, cancel_lines, style_breakdown, product_breakdown, reason_df, ctx)
@@ -924,6 +1482,51 @@ live_summary = pd.DataFrame([
 ], columns=["Segment", "Cancelled Orders", "Total Created Orders in Segment", "Segment Cancel Rate", "% of Cancelled Orders"])
 st.dataframe(live_summary, use_container_width=True, hide_index=True)
 
+if has_return_data:
+    st.subheader("Returned 包裹直播归因：按原订单 Created Time")
+    st.caption("Returned Order 表上传后全部视作 returned；程序按包裹去重，优先用 Return Logistics Tracking ID，缺失时用 Return Order ID / Order ID 兜底。Created Time 从订单总表按 Order ID 匹配。")
+    r1, r2, r3, r4 = st.columns(4)
+    r1.metric("Returned Packages", fmt_num(return_total_packages))
+    r2.metric("Created in Live Time", fmt_num(return_live_packages), help="原订单 Created Time 落在直播①或直播②")
+    r3.metric("Live-created %", fmt_pct(return_live_packages, return_total_packages))
+    r4.metric("Unknown Created Time", fmt_num(return_unknown_packages), help="Return 表里的 Order ID 未能在订单总表中匹配到 Created Time")
+    st.dataframe(return_segment_summary, use_container_width=True, hide_index=True)
+
+    st.subheader("Returned Orders 核心指标")
+    rr1, rr2, rr3, rr4 = st.columns(4)
+    rr1.metric("Seller Fault", fmt_num(return_seller_fault_packages), help="Return Reason 只要不是 No Longer Needed，全部归为 Seller Fault")
+    rr2.metric("Request Cancelled", fmt_num(return_request_cancelled_packages), help="S column Return Sub Status")
+    rr3.metric("已寄出退回包裹", fmt_num(return_shipped_packages), help="Q column Return Logistics Tracking ID 有记录")
+    rr4.metric("Refund Only", fmt_num(return_refund_only_packages), help="L column Return Type = Refund Only")
+    st.dataframe(return_boolean_summary, use_container_width=True, hide_index=True)
+
+    rt1, rt2, rt3, rt4, rt5, rt6, rt7 = st.tabs(["Return Reason", "Seller Fault", "退货 SKU Top10", "退货款式 J", "退货产品链接 I", "Return Type", "Return Package 明细"])
+    with rt1:
+        st.caption("N column Return Reason：提交退货的各原因占比，按 returned package 去重统计。")
+        st.dataframe(display_return_breakdown_table(return_reason_df), use_container_width=True, hide_index=True)
+    with rt2:
+        st.caption("除 No Longer Needed 外，其他 Return Reason 全部归为 Seller Fault。")
+        st.dataframe(display_return_breakdown_table(return_fault_df), use_container_width=True, hide_index=True)
+    with rt3:
+        st.caption("H column Seller SKU：先忽略 -S / -M / -L 等尺码后缀，再匹配产品图册 `款式英文名称`；只显示 Top10，不显示 SKU 编码。")
+        st.dataframe(display_return_breakdown_table(return_sku_breakdown), use_container_width=True, hide_index=True)
+    with rt4:
+        st.caption("J column SKU Name：作为退货款式，自动去掉末尾尺码。")
+        st.dataframe(display_return_breakdown_table(return_style_breakdown), use_container_width=True, hide_index=True)
+    with rt5:
+        st.caption("I column Product Name：统计 Top5 高退货产品链接，以及指定产品链接的退货占比。")
+        st.markdown("**Top5 高退货产品链接**")
+        st.dataframe(display_return_breakdown_table(return_product_link_top5), use_container_width=True, hide_index=True)
+        st.markdown("**指定产品链接退货占比**")
+        st.dataframe(display_return_breakdown_table(return_product_link_targets), use_container_width=True, hide_index=True)
+    with rt6:
+        st.caption("L column Return Type；Refund Only 占比已在上方核心指标中单独展示。")
+        st.dataframe(display_return_breakdown_table(return_type_df), use_container_width=True, hide_index=True)
+        st.caption("S column Return Sub Status；Request Cancelled 占比已在上方核心指标中单独展示。")
+        st.dataframe(display_return_breakdown_table(return_status_df), use_container_width=True, hide_index=True)
+    with rt7:
+        st.dataframe(return_packages_df, use_container_width=True, hide_index=True)
+
 st.subheader("Breakdowns")
 tab1, tab2, tab3, tab4 = st.tabs(["Cancel Reasons", "甲型 / SKU", "H Column 产品链接", "订单级 Cancelled 明细"])
 with tab1:
@@ -943,7 +1546,7 @@ with d1:
     st.download_button(
         "下载 HTML Report",
         data=html_report.encode("utf-8"),
-        file_name=f"cancelled_orders_report_{start_date}_{end_date}.html",
+        file_name=f"cancelled_returned_orders_report_{start_date}_{end_date}.html",
         mime="text/html",
         use_container_width=True,
     )
@@ -951,7 +1554,7 @@ with d2:
     st.download_button(
         "下载清洗后 Excel",
         data=excel_bytes,
-        file_name=f"cancelled_orders_cleaned_{start_date}_{end_date}.xlsx",
+        file_name=f"cancelled_returned_orders_cleaned_{start_date}_{end_date}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
