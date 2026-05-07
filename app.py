@@ -47,8 +47,8 @@ RETURN_TARGET_PRODUCT_LINKS = [
     "Summer Shine",
     "Best Seller",
     "Organizer Binder",
-    "10 PCs TOOLKITS",
-    "BUY 4 GET 1 FREE NailVesta Handcrafted 3D Press-On Nails | Reusable, Long-Lasting, Salon-Quality",
+    "TOOLKITS",
+    "BUY 4 GET 1 FREE",
 ]
 
 
