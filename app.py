@@ -14,7 +14,7 @@ import streamlit.components.v1 as components
 # Page config
 # =========================
 st.set_page_config(
-    page_title="Cancelled + Returned Orders Report",
+    page_title="Cancelled + Returned Orders Report Generator",
     page_icon="💅",
     layout="wide",
 )
@@ -309,50 +309,95 @@ def filter_by_created_date(lines: pd.DataFrame, start_date: date, end_date: date
     return df[(df["Created Date"] >= start_date) & (df["Created Date"] <= end_date)].copy()
 
 
+def _join_unique_by_order_fast(df: pd.DataFrame, col: str, max_items: int = 50) -> pd.Series:
+    """Fast replacement for per-group join_unique. Returns Series indexed by Order ID."""
+    if df.empty or col not in df.columns:
+        return pd.Series(dtype=object)
+    x = df[["Order ID", col]].copy()
+    x[col] = (
+        x[col]
+        .fillna("")
+        .astype(str)
+        .str.replace("\t", "", regex=False)
+        .str.replace("\r", " ", regex=False)
+        .str.replace("\n", " ", regex=False)
+        .str.strip()
+    )
+    x = x[(x[col] != "") & (~x[col].str.lower().isin(["nan", "nat", "none"]))]
+    if x.empty:
+        return pd.Series(dtype=object)
+    x = x.drop_duplicates(["Order ID", col])
+    x["__rank"] = x.groupby("Order ID", sort=False).cumcount()
+    x = x[x["__rank"] < max_items].drop(columns="__rank")
+    return x.groupby("Order ID", sort=False)[col].agg(lambda vals: "; ".join(vals))
+
+
+def _classify_live_segment_series(hour_series: pd.Series, live1_start, live1_end, live2_start, live2_end) -> pd.Series:
+    h = pd.to_numeric(hour_series, errors="coerce")
+    out = pd.Series("非直播", index=hour_series.index, dtype=object)
+    out[(h >= live1_start) & (h < live1_end)] = "直播①"
+    out[(h >= live2_start) & (h < live2_end)] = "直播②"
+    out[h.isna()] = "Unknown"
+    return out
+
+
 def build_order_level(lines: pd.DataFrame, live1_start, live1_end, live2_start, live2_end) -> pd.DataFrame:
+    """
+    Build one-row-per-Order-ID table.
+    Optimized because the all-order file can be large and Streamlit reruns the app on every interaction.
+    """
     if lines.empty:
         return pd.DataFrame()
 
     tmp = lines.copy()
-    tmp["__status_cancelled_int"] = tmp["Is Cancelled Line"].astype(int)
+    tmp["__status_cancelled_int"] = tmp["Is Cancelled Line"].astype("int8")
 
+    # Use vectorized/built-in aggregations. For TikTok exports, order-level fields are
+    # duplicated across SKU rows, so first/min/sum are sufficient and far faster than
+    # Python custom functions per Order ID.
     agg = {
         "Created Datetime": "min",
-        "Cancelled Datetime": first_non_null,
-        "Order Status Clean": mode_or_first,
+        "Cancelled Datetime": "first",
+        "Order Status Clean": "first",
         "__status_cancelled_int": "max",
-        "Cancel Reason Clean": mode_or_first,
-        "Nail Style": join_unique,
-        "Product Link / Product Name": join_unique,
+        "Cancel Reason Clean": "first",
         "Metric Units": "sum",
         "SKU Row Count": "sum",
         "Quantity Parsed": "sum",
     }
-    if "Seller SKU" in tmp.columns:
-        agg["Seller SKU"] = join_unique
-    if "Variation" in tmp.columns:
-        agg["Variation"] = join_unique
     if "Order Amount Parsed" in tmp.columns:
-        agg["Order Amount Parsed"] = first_non_null
+        agg["Order Amount Parsed"] = "first"
     if "SKU Subtotal After Discount Parsed" in tmp.columns:
         agg["SKU Subtotal After Discount Parsed"] = "sum"
 
-    od = tmp.groupby("Order ID", as_index=False).agg(agg)
+    od = tmp.groupby("Order ID", as_index=False, sort=False).agg(agg)
+
+    # Detail columns are only for display/export. Build them with a faster de-duped join.
+    for col in ["Nail Style", "Product Link / Product Name", "Seller SKU", "Variation"]:
+        if col in tmp.columns:
+            joined = _join_unique_by_order_fast(tmp, col)
+            od = od.merge(joined.rename(col), on="Order ID", how="left")
+            if col in ["Nail Style", "Product Link / Product Name"]:
+                od[col] = od[col].fillna("Unknown")
+            else:
+                od[col] = od[col].fillna("")
+
     od["Is Cancelled"] = od["__status_cancelled_int"].eq(1)
     od["Order Status Final"] = np.where(od["Is Cancelled"], "Cancelled", od["Order Status Clean"])
     od["Created Hour"] = od["Created Datetime"].dt.hour
     od["Created Weekday Num"] = od["Created Datetime"].dt.weekday
     od["Created Day Type"] = np.where(od["Created Weekday Num"] >= 5, "周末 Weekend", "工作日 Weekday")
-    od["Live Segment by Created Time"] = od["Created Hour"].apply(
-        lambda h: classify_live_segment(h, live1_start, live1_end, live2_start, live2_end)
+    od.loc[od["Created Datetime"].isna(), "Created Day Type"] = "Unknown"
+    od["Live Segment by Created Time"] = _classify_live_segment_series(
+        od["Created Hour"], live1_start, live1_end, live2_start, live2_end
     )
     od["Is Live by Created Time"] = od["Live Segment by Created Time"].isin(["直播①", "直播②"])
     od["Cancelled Hour"] = od["Cancelled Datetime"].dt.hour
     od["Cancelled Day Type"] = np.where(
         od["Cancelled Datetime"].dt.weekday >= 5, "周末 Weekend", "工作日 Weekday"
     )
+    od.loc[od["Cancelled Datetime"].isna(), "Cancelled Day Type"] = "Unknown"
     return od.drop(columns=["__status_cancelled_int"])
-
 
 def make_breakdown(lines: pd.DataFrame, group_col: str, top_n: int, metric_label: str) -> pd.DataFrame:
     if lines.empty or group_col not in lines.columns:
@@ -1341,7 +1386,13 @@ if returned_file is not None:
                 st.warning("产品图册未识别到 `SKU` 和 `款式英文名称` 两列；退货 SKU Top10 将使用 J column SKU Name 兜底显示。")
         # Use the full all-order file for lookup so returned packages can still match even if
         # the current report date filter is narrower than the uploaded order total table.
-        all_orders_lookup_full = build_order_level(lines, live1_start, live1_end, live2_start, live2_end)
+        # This lookup only needs Order ID + Created Datetime, so do not rebuild the full
+        # order-level report table here; otherwise large files will keep Streamlit running.
+        all_orders_lookup_full = (
+            lines[["Order ID", "Created Datetime"]]
+            .groupby("Order ID", as_index=False, sort=False)["Created Datetime"]
+            .min()
+        )
         return_lines_df = prepare_return_line_level(
             return_raw, all_orders_lookup_full, live1_start, live1_end, live2_start, live2_end
         )
