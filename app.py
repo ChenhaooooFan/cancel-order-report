@@ -1,7 +1,7 @@
 import html
 import json
 from io import BytesIO
-from datetime import date, datetime, timedelta
+from datetime import date
 
 import numpy as np
 import pandas as pd
@@ -13,30 +13,50 @@ import streamlit.components.v1 as components
 # Page config
 # =========================
 st.set_page_config(
-    page_title="Cancel Order Report Generator",
-    page_icon="📉",
+    page_title="Cancelled Orders Report Generator",
+    page_icon="💅",
     layout="wide",
 )
 
 
 # =========================
-# Helpers
+# Constants
 # =========================
-REQUIRED_COLUMNS = ["Order ID", "Cancelled Time", "Cancel Reason"]
-PREFERRED_TIME_COLS = ["Cancelled Time", "Created Time", "Paid Time"]
+REQUIRED_COLUMNS = ["Order ID", "Order Status", "Created Time", "Product Name"]
+OPTIONAL_COLUMNS = [
+    "Cancelled Time", "Cancel Reason", "Cancel By", "Seller SKU", "SKU ID",
+    "Variation", "Quantity", "Order Amount", "SKU Subtotal After Discount",
+    "Cancelation/Return Type", "Payment Method", "Fulfillment Type", "Delivery Option",
+]
+SIZE_TOKENS = {
+    "XS", "S", "M", "L", "XL", "XXL", "XXXL",
+    "EXTRA SMALL", "SMALL", "MEDIUM", "LARGE", "EXTRA LARGE",
+}
 
 
+# =========================
+# Basic helpers
+# =========================
 def clean_column_name(col: str) -> str:
     return str(col).replace("\ufeff", "").strip()
 
 
 def stringify_id(x) -> str:
-    """Keep long TikTok Order IDs safe as strings, without .0 / tabs / spaces."""
+    """Keep long TikTok IDs safe as strings, without .0 / tabs / spaces."""
     if pd.isna(x):
         return ""
-    s = str(x).replace("\t", "").strip()
+    s = str(x).replace("\t", "").replace("\r", "").replace("\n", "").strip()
     if s.endswith(".0") and s[:-2].replace(".", "", 1).isdigit():
         s = s[:-2]
+    return s
+
+
+def normalize_text(x, default="Unknown") -> str:
+    if pd.isna(x):
+        return default
+    s = str(x).replace("\t", "").replace("\r", " ").replace("\n", " ").strip()
+    if not s or s.lower() in {"nan", "nat", "none"}:
+        return default
     return s
 
 
@@ -47,10 +67,9 @@ def parse_datetime_series(s: pd.Series) -> pd.Series:
         .str.replace("\r", "", regex=False)
         .str.replace("\n", " ", regex=False)
         .str.strip()
-        .replace({"": np.nan, "nan": np.nan, "NaT": np.nan})
+        .replace({"": np.nan, "nan": np.nan, "NaT": np.nan, "None": np.nan})
     )
-    # TikTok exports are usually like 04/05/2026 11:54:28 PM.
-    # Try the exact format first to avoid ambiguous parsing, then fallback for edge cases.
+    # TikTok commonly exports: 04/05/2026 11:54:28 PM
     parsed = pd.to_datetime(cleaned, format="%m/%d/%Y %I:%M:%S %p", errors="coerce")
     missing = parsed.isna() & cleaned.notna()
     if missing.any():
@@ -58,15 +77,18 @@ def parse_datetime_series(s: pd.Series) -> pd.Series:
     return parsed
 
 
-def parse_money_series(s: pd.Series) -> pd.Series:
-    return pd.to_numeric(
+def parse_number_series(s: pd.Series, default=np.nan) -> pd.Series:
+    out = pd.to_numeric(
         s.astype(str)
         .str.replace("$", "", regex=False)
         .str.replace(",", "", regex=False)
         .str.replace("\t", "", regex=False)
         .str.strip(),
         errors="coerce",
-    ).fillna(0)
+    )
+    if not pd.isna(default):
+        out = out.fillna(default)
+    return out
 
 
 def pct(n, d, digits=1):
@@ -79,22 +101,55 @@ def safe_div(n, d):
     return float(n) / float(d) if d else 0.0
 
 
-def fmt_float(x, digits=1):
+def fmt_pct(n, d, digits=1):
+    return f"{pct(n, d, digits):.{digits}f}%"
+
+
+def fmt_num(x, digits=0):
     if pd.isna(x):
         x = 0
-    return f"{x:.{digits}f}"
+    if digits == 0:
+        return f"{int(round(float(x))):,}"
+    return f"{float(x):,.{digits}f}"
 
 
 def fmt_money(x):
     if pd.isna(x):
         x = 0
-    return f"${x:,.2f}"
+    return f"${float(x):,.2f}"
+
+
+def mode_or_first(series: pd.Series, default="Unknown"):
+    x = series.dropna().astype(str).str.replace("\t", "", regex=False).str.strip()
+    x = x[(x != "") & (~x.str.lower().isin(["nan", "nat", "none"]))]
+    if len(x) == 0:
+        return default
+    mode = x.mode()
+    return mode.iloc[0] if len(mode) else x.iloc[0]
+
+
+def first_non_null(series: pd.Series):
+    x = series.dropna()
+    x = x[x.astype(str).str.strip() != ""]
+    return x.iloc[0] if len(x) else np.nan
+
+
+def join_unique(series: pd.Series, max_items=50):
+    vals, seen = [], set()
+    for v in series.dropna().astype(str):
+        s = normalize_text(v, default="")
+        if s and s not in seen:
+            seen.add(s)
+            vals.append(s)
+        if len(vals) >= max_items:
+            vals.append("...")
+            break
+    return "; ".join(vals)
 
 
 def read_uploaded_file(uploaded_file) -> pd.DataFrame:
     name = uploaded_file.name.lower()
     if name.endswith(".csv"):
-        # Try common encodings. TikTok exports usually work with utf-8-sig.
         data = uploaded_file.getvalue()
         last_err = None
         for enc in ["utf-8-sig", "utf-8", "gbk", "latin1"]:
@@ -108,101 +163,25 @@ def read_uploaded_file(uploaded_file) -> pd.DataFrame:
     raise ValueError("只支持 CSV / XLSX / XLS 文件")
 
 
-def first_non_null(series: pd.Series):
-    x = series.dropna()
-    x = x[x.astype(str).str.strip() != ""]
-    return x.iloc[0] if len(x) else np.nan
+def derive_nail_style(row) -> str:
+    """
+    TikTok Variation is usually like 'Acai Bloom, L'.
+    For nail-style breakdown, remove the final size token when possible.
+    Fallback: Seller SKU, then Product Name.
+    """
+    variation = normalize_text(row.get("Variation", ""), default="")
+    if variation:
+        parts = [p.strip() for p in variation.split(",") if p.strip()]
+        if len(parts) >= 2 and parts[-1].upper() in SIZE_TOKENS:
+            return ", ".join(parts[:-1]).strip() or variation
+        return variation
+    sku = normalize_text(row.get("Seller SKU", ""), default="")
+    if sku:
+        return sku
+    return normalize_text(row.get("Product Name", ""), default="Unknown")
 
 
-def mode_or_first(series: pd.Series):
-    x = series.dropna().astype(str).str.strip()
-    x = x[x != ""]
-    if len(x) == 0:
-        return "Unknown"
-    mode = x.mode()
-    return mode.iloc[0] if len(mode) else x.iloc[0]
-
-
-def join_unique(series: pd.Series, max_items=20):
-    vals = []
-    seen = set()
-    for v in series.dropna().astype(str):
-        v = v.replace("\t", "").strip()
-        if v and v not in seen:
-            seen.add(v)
-            vals.append(v)
-        if len(vals) >= max_items:
-            vals.append("...")
-            break
-    return "; ".join(vals)
-
-
-def build_order_level(raw: pd.DataFrame, order_id_col: str) -> pd.DataFrame:
-    df = raw.copy()
-    df.columns = [clean_column_name(c) for c in df.columns]
-    order_id_col = clean_column_name(order_id_col)
-
-    df[order_id_col] = df[order_id_col].apply(stringify_id)
-    df = df[df[order_id_col] != ""].copy()
-
-    # Parse all time columns that exist.
-    for c in PREFERRED_TIME_COLS + ["RTS Time", "Shipped Time", "Delivered Time"]:
-        if c in df.columns:
-            df[f"__parsed_{c}"] = parse_datetime_series(df[c])
-
-    # Numeric fields useful for optional business context.
-    for c in ["Quantity", "Sku Quantity of return", "Order Amount", "Order Refund Amount", "SKU Subtotal After Discount"]:
-        if c in df.columns:
-            df[f"__num_{c}"] = parse_money_series(df[c])
-
-    agg = {}
-    for c in df.columns:
-        if c == order_id_col:
-            continue
-        if c.startswith("__parsed_"):
-            agg[c] = first_non_null
-        elif c in ["Cancel Reason", "Cancel By", "Order Status", "Order Substatus", "Cancelation/Return Type", "Payment Method", "Fulfillment Type", "Delivery Option", "State", "Country"]:
-            agg[c] = mode_or_first
-        elif c.startswith("__num_Order Amount"):
-            agg[c] = first_non_null  # Order Amount repeats on each SKU row.
-        elif c.startswith("__num_Order Refund Amount"):
-            agg[c] = "sum"           # Refund amount is usually SKU-level; sum to order-level.
-        elif c.startswith("__num_Quantity") or c.startswith("__num_Sku Quantity") or c.startswith("__num_SKU Subtotal"):
-            agg[c] = "sum"
-        elif c in ["Seller SKU", "SKU ID", "Product Name", "Variation", "Product Category"]:
-            agg[c] = join_unique
-        else:
-            agg[c] = first_non_null
-
-    order_df = df.groupby(order_id_col, as_index=False).agg(agg)
-    order_df = order_df.rename(columns={order_id_col: "Order ID"})
-
-    # Friendly derived columns.
-    if "Seller SKU" in df.columns:
-        sku_count = df.groupby(order_id_col)["Seller SKU"].nunique(dropna=True).reset_index(name="SKU Count")
-        sku_count[order_id_col] = sku_count[order_id_col].apply(stringify_id)
-        sku_count = sku_count.rename(columns={order_id_col: "Order ID"})
-        order_df = order_df.merge(sku_count, on="Order ID", how="left")
-    else:
-        order_df["SKU Count"] = np.nan
-
-    if "__num_Quantity" in order_df.columns:
-        order_df = order_df.rename(columns={"__num_Quantity": "Item Quantity"})
-    if "__num_Order Amount" in order_df.columns:
-        order_df = order_df.rename(columns={"__num_Order Amount": "Order Amount Parsed"})
-    if "__num_Order Refund Amount" in order_df.columns:
-        order_df = order_df.rename(columns={"__num_Order Refund Amount": "Order Refund Amount Parsed"})
-    if "__parsed_Cancelled Time" in order_df.columns:
-        order_df = order_df.rename(columns={"__parsed_Cancelled Time": "Cancelled Datetime"})
-    if "__parsed_Created Time" in order_df.columns:
-        order_df = order_df.rename(columns={"__parsed_Created Time": "Created Datetime"})
-    if "__parsed_Paid Time" in order_df.columns:
-        order_df = order_df.rename(columns={"__parsed_Paid Time": "Paid Datetime"})
-
-    return order_df
-
-
-def classify_live_segment(hour: int, live1_start: int, live1_end: int, live2_start: int, live2_end: int) -> str:
+def classify_live_segment(hour, live1_start, live1_end, live2_start, live2_end) -> str:
     if pd.isna(hour):
         return "Unknown"
     h = int(hour)
@@ -213,23 +192,6 @@ def classify_live_segment(hour: int, live1_start: int, live1_end: int, live2_sta
     return "非直播"
 
 
-def prepare_analysis(order_df: pd.DataFrame, time_col: str, reason_col: str,
-                     start_date: date, end_date: date,
-                     live1_start: int, live1_end: int, live2_start: int, live2_end: int) -> pd.DataFrame:
-    df = order_df.copy()
-    df["__dt"] = df[time_col]
-    df = df[df["__dt"].notna()].copy()
-    df["Date"] = df["__dt"].dt.date
-    df = df[(df["Date"] >= start_date) & (df["Date"] <= end_date)].copy()
-    df["Hour"] = df["__dt"].dt.hour.astype(int)
-    df["Weekday Num"] = df["__dt"].dt.weekday
-    df["Day Type"] = np.where(df["Weekday Num"] >= 5, "周末 Weekend", "工作日 Weekday")
-    df["Live Segment"] = df["Hour"].apply(lambda h: classify_live_segment(h, live1_start, live1_end, live2_start, live2_end))
-    df["Is Live"] = df["Live Segment"].isin(["直播①", "直播②"])
-    df["Cancel Reason Clean"] = df[reason_col].fillna("Unknown").astype(str).str.strip().replace({"": "Unknown", "nan": "Unknown"})
-    return df
-
-
 def calendar_day_counts(start_date: date, end_date: date):
     days = pd.date_range(start=start_date, end=end_date, freq="D")
     weekday_days = int((days.weekday < 5).sum())
@@ -237,11 +199,11 @@ def calendar_day_counts(start_date: date, end_date: date):
     return len(days), weekday_days, weekend_days
 
 
-def hourly_counts(df: pd.DataFrame, mask=None):
-    if mask is None:
-        s = df.groupby("Hour").size()
-    else:
-        s = df[mask].groupby("Hour").size()
+def hourly_counts_from_series(dt_series: pd.Series):
+    valid = dt_series.dropna()
+    if len(valid) == 0:
+        return [0] * 24
+    s = valid.dt.hour.value_counts()
     return [int(s.get(h, 0)) for h in range(24)]
 
 
@@ -257,202 +219,288 @@ def peak_label(counts):
     return f"{hrs[0]}点等", maxv
 
 
-def reason_table(df: pd.DataFrame, n=7):
-    total = len(df)
-    counts = df["Cancel Reason Clean"].value_counts().head(n)
-    rows = []
-    max_count = int(counts.max()) if len(counts) else 0
-    for reason, cnt in counts.items():
-        rows.append({
-            "reason": str(reason),
-            "count": int(cnt),
-            "pct": pct(cnt, total),
-            "bar": pct(cnt, max_count, 0) if max_count else 0,
-        })
-    return rows
+# =========================
+# Cleaning + aggregation
+# =========================
+def validate_columns(df: pd.DataFrame):
+    df.columns = [clean_column_name(c) for c in df.columns]
+    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+    return missing
 
 
-def make_reason_rows(rows, color="var(--live1)"):
-    if not rows:
+def prepare_line_level(raw: pd.DataFrame, metric_mode: str) -> pd.DataFrame:
+    df = raw.copy()
+    df.columns = [clean_column_name(c) for c in df.columns]
+
+    df["Order ID"] = df["Order ID"].apply(stringify_id)
+    df = df[df["Order ID"] != ""].copy()
+
+    df["Order Status Clean"] = df["Order Status"].apply(lambda x: normalize_text(x, default="Unknown"))
+    df["Is Cancelled Line"] = df["Order Status Clean"].str.lower().isin(["cancelled", "canceled"])
+
+    df["Created Datetime"] = parse_datetime_series(df["Created Time"])
+    if "Cancelled Time" in df.columns:
+        df["Cancelled Datetime"] = parse_datetime_series(df["Cancelled Time"])
+    else:
+        df["Cancelled Datetime"] = pd.NaT
+
+    if "Cancel Reason" in df.columns:
+        df["Cancel Reason Clean"] = df["Cancel Reason"].apply(lambda x: normalize_text(x, default="Unknown"))
+    else:
+        df["Cancel Reason Clean"] = "Unknown"
+
+    if "Product Name" in df.columns:
+        df["Product Link / Product Name"] = df["Product Name"].apply(lambda x: normalize_text(x, default="Unknown"))
+    else:
+        df["Product Link / Product Name"] = "Unknown"
+
+    if "Variation" not in df.columns:
+        df["Variation"] = ""
+    if "Seller SKU" not in df.columns:
+        df["Seller SKU"] = ""
+
+    df["Nail Style"] = df.apply(derive_nail_style, axis=1)
+
+    if "Quantity" in df.columns:
+        qty = parse_number_series(df["Quantity"], default=np.nan)
+        qty = qty.fillna(1)
+        qty = qty.where(qty > 0, 1)
+    else:
+        qty = pd.Series([1] * len(df), index=df.index)
+
+    df["SKU Row Count"] = 1
+    df["Quantity Parsed"] = qty
+    if metric_mode == "quantity":
+        df["Metric Units"] = df["Quantity Parsed"]
+        df["Metric Label"] = "按 Quantity 汇总"
+    else:
+        df["Metric Units"] = 1
+        df["Metric Label"] = "按 SKU 行数汇总"
+
+    for c in ["Order Amount", "SKU Subtotal After Discount", "Order Refund Amount"]:
+        if c in df.columns:
+            df[f"{c} Parsed"] = parse_number_series(df[c], default=0)
+
+    return df
+
+
+def filter_by_created_date(lines: pd.DataFrame, start_date: date, end_date: date) -> pd.DataFrame:
+    df = lines.copy()
+    df = df[df["Created Datetime"].notna()].copy()
+    df["Created Date"] = df["Created Datetime"].dt.date
+    return df[(df["Created Date"] >= start_date) & (df["Created Date"] <= end_date)].copy()
+
+
+def build_order_level(lines: pd.DataFrame, live1_start, live1_end, live2_start, live2_end) -> pd.DataFrame:
+    if lines.empty:
+        return pd.DataFrame()
+
+    tmp = lines.copy()
+    tmp["__status_cancelled_int"] = tmp["Is Cancelled Line"].astype(int)
+
+    agg = {
+        "Created Datetime": "min",
+        "Cancelled Datetime": first_non_null,
+        "Order Status Clean": mode_or_first,
+        "__status_cancelled_int": "max",
+        "Cancel Reason Clean": mode_or_first,
+        "Nail Style": join_unique,
+        "Product Link / Product Name": join_unique,
+        "Metric Units": "sum",
+        "SKU Row Count": "sum",
+        "Quantity Parsed": "sum",
+    }
+    if "Seller SKU" in tmp.columns:
+        agg["Seller SKU"] = join_unique
+    if "Variation" in tmp.columns:
+        agg["Variation"] = join_unique
+    if "Order Amount Parsed" in tmp.columns:
+        agg["Order Amount Parsed"] = first_non_null
+    if "SKU Subtotal After Discount Parsed" in tmp.columns:
+        agg["SKU Subtotal After Discount Parsed"] = "sum"
+
+    od = tmp.groupby("Order ID", as_index=False).agg(agg)
+    od["Is Cancelled"] = od["__status_cancelled_int"].eq(1)
+    od["Order Status Final"] = np.where(od["Is Cancelled"], "Cancelled", od["Order Status Clean"])
+    od["Created Hour"] = od["Created Datetime"].dt.hour
+    od["Created Weekday Num"] = od["Created Datetime"].dt.weekday
+    od["Created Day Type"] = np.where(od["Created Weekday Num"] >= 5, "周末 Weekend", "工作日 Weekday")
+    od["Live Segment by Created Time"] = od["Created Hour"].apply(
+        lambda h: classify_live_segment(h, live1_start, live1_end, live2_start, live2_end)
+    )
+    od["Is Live by Created Time"] = od["Live Segment by Created Time"].isin(["直播①", "直播②"])
+    od["Cancelled Hour"] = od["Cancelled Datetime"].dt.hour
+    od["Cancelled Day Type"] = np.where(
+        od["Cancelled Datetime"].dt.weekday >= 5, "周末 Weekend", "工作日 Weekday"
+    )
+    return od.drop(columns=["__status_cancelled_int"])
+
+
+def make_breakdown(lines: pd.DataFrame, group_col: str, top_n: int, metric_label: str) -> pd.DataFrame:
+    if lines.empty or group_col not in lines.columns:
+        return pd.DataFrame(columns=[group_col, metric_label, "Order Count", "Pct", "SKU Row Count", "Quantity"])
+    total_metric = lines["Metric Units"].sum()
+    out = (
+        lines.groupby(group_col, dropna=False)
+        .agg(
+            **{
+                metric_label: ("Metric Units", "sum"),
+                "Order Count": ("Order ID", "nunique"),
+                "SKU Row Count": ("SKU Row Count", "sum"),
+                "Quantity": ("Quantity Parsed", "sum"),
+            }
+        )
+        .reset_index()
+    )
+    out[group_col] = out[group_col].apply(lambda x: normalize_text(x, default="Unknown"))
+    out["Pct"] = out[metric_label].apply(lambda x: pct(x, total_metric))
+    out = out.sort_values([metric_label, "Order Count"], ascending=[False, False]).head(top_n).reset_index(drop=True)
+    return out
+
+
+def value_count_table(df: pd.DataFrame, col: str, denominator: int, top_n=10) -> pd.DataFrame:
+    if df.empty or col not in df.columns:
+        return pd.DataFrame(columns=[col, "Order Count", "Pct"])
+    out = df[col].fillna("Unknown").astype(str).str.strip().replace({"": "Unknown"}).value_counts().head(top_n).reset_index()
+    out.columns = [col, "Order Count"]
+    out["Pct"] = out["Order Count"].apply(lambda x: pct(x, denominator))
+    return out
+
+
+# =========================
+# HTML rendering helpers
+# =========================
+def make_reason_rows(reason_df: pd.DataFrame, color="var(--live1)"):
+    if reason_df.empty:
         return '<div class="empty-note">暂无数据</div>'
-    out = []
-    for r in rows:
-        out.append(f'''
+    max_count = reason_df["Order Count"].max()
+    rows = []
+    for _, r in reason_df.iterrows():
+        name = str(r.iloc[0])
+        width = pct(r["Order Count"], max_count, 0) if max_count else 0
+        rows.append(f'''
           <div class="reason-row">
-            <div class="reason-name" title="{html.escape(r['reason'])}">{html.escape(r['reason'])}</div>
-            <div class="reason-bar-wrap"><div class="reason-bar" style="width:{r['bar']}%;background:{color}"></div></div>
-            <div class="reason-cnt">{r['count']}</div>
-            <div class="reason-pct">{r['pct']:.1f}%</div>
+            <div class="reason-name" title="{html.escape(name)}">{html.escape(name)}</div>
+            <div class="reason-bar-wrap"><div class="reason-bar" style="width:{width}%;background:{color}"></div></div>
+            <div class="reason-cnt">{fmt_num(r['Order Count'])}</div>
+            <div class="reason-pct">{float(r['Pct']):.1f}%</div>
           </div>
         ''')
-    return "\n".join(out)
+    return "\n".join(rows)
 
 
-def make_insights(df: pd.DataFrame, start_date: date, end_date: date,
-                  live1_start: int, live1_end: int, live2_start: int, live2_end: int):
-    total = len(df)
-    total_days, weekday_days, weekend_days = calendar_day_counts(start_date, end_date)
-    weekday_count = int((df["Day Type"] == "工作日 Weekday").sum())
-    weekend_count = int((df["Day Type"] == "周末 Weekend").sum())
-    weekday_avg = safe_div(weekday_count, weekday_days)
-    weekend_avg = safe_div(weekend_count, weekend_days)
+def make_breakdown_rows(bdf: pd.DataFrame, name_col: str, metric_col: str, color="var(--live1)"):
+    if bdf.empty:
+        return '<div class="empty-note">暂无数据</div>'
+    max_metric = bdf[metric_col].max()
+    rows = []
+    for _, r in bdf.iterrows():
+        name = str(r[name_col])
+        width = pct(r[metric_col], max_metric, 0) if max_metric else 0
+        rows.append(f'''
+          <div class="break-row">
+            <div class="break-name" title="{html.escape(name)}">{html.escape(name)}</div>
+            <div class="break-bar-wrap"><div class="break-bar" style="width:{width}%;background:{color}"></div></div>
+            <div class="break-num">{fmt_num(r[metric_col])}</div>
+            <div class="break-orders">{fmt_num(r['Order Count'])} orders</div>
+            <div class="break-pct">{float(r['Pct']):.1f}%</div>
+          </div>
+        ''')
+    return "\n".join(rows)
 
-    live1_count = int((df["Live Segment"] == "直播①").sum())
-    live2_count = int((df["Live Segment"] == "直播②").sum())
-    live_count = live1_count + live2_count
-    nonlive_count = total - live_count
-    live_hours = max(0, live1_end - live1_start) + max(0, live2_end - live2_start)
-    nonlive_hours = 24 - live_hours
-    live_intensity = safe_div(live_count, live_hours)
-    nonlive_intensity = safe_div(nonlive_count, nonlive_hours)
-    intensity_multiple = safe_div(live_intensity, nonlive_intensity)
 
-    all_counts = hourly_counts(df)
-    pk_label, pk_val = peak_label(all_counts)
+def build_insights(all_orders: pd.DataFrame, cancel_orders: pd.DataFrame, cancel_lines: pd.DataFrame,
+                   style_breakdown: pd.DataFrame, product_breakdown: pd.DataFrame,
+                   start_date: date, end_date: date, live1_start, live1_end, live2_start, live2_end):
+    total_orders = len(all_orders)
+    cancel_orders_n = len(cancel_orders)
+    cancel_rate = pct(cancel_orders_n, total_orders)
 
-    wd_live_pct = pct(int(((df["Day Type"] == "工作日 Weekday") & df["Is Live"]).sum()), weekday_count)
-    we_live_pct = pct(int(((df["Day Type"] == "周末 Weekend") & df["Is Live"]).sum()), weekend_count)
+    live_all = int(all_orders["Is Live by Created Time"].sum()) if not all_orders.empty else 0
+    nonlive_all = total_orders - live_all
+    live_cancel = int(cancel_orders["Is Live by Created Time"].sum()) if not cancel_orders.empty else 0
+    nonlive_cancel = cancel_orders_n - live_cancel
+    live_cancel_rate = pct(live_cancel, live_all)
+    nonlive_cancel_rate = pct(nonlive_cancel, nonlive_all)
 
-    top_reason = "-"
-    top_reason_count = 0
-    top_reason_pct = 0
-    if total:
-        vc = df["Cancel Reason Clean"].value_counts()
-        top_reason = str(vc.index[0])
-        top_reason_count = int(vc.iloc[0])
-        top_reason_pct = pct(top_reason_count, total)
+    created_counts = hourly_counts_from_series(cancel_orders["Created Datetime"] if not cancel_orders.empty else pd.Series(dtype="datetime64[ns]"))
+    cancel_counts = hourly_counts_from_series(cancel_orders["Cancelled Datetime"] if not cancel_orders.empty else pd.Series(dtype="datetime64[ns]"))
+    created_peak_label, created_peak_val = peak_label(created_counts)
+    cancel_peak_label, cancel_peak_val = peak_label(cancel_counts)
 
-    payment_count = int(df["Cancel Reason Clean"].str.contains("payment", case=False, na=False).sum())
-    address_count = int(df["Cancel Reason Clean"].str.contains("address", case=False, na=False).sum())
-    mistake_count = int(df["Cancel Reason Clean"].str.contains("mistake|mistaken", case=False, na=False).sum())
+    reason_df = value_count_table(cancel_orders, "Cancel Reason Clean", cancel_orders_n, top_n=5)
+    top_reason = str(reason_df.iloc[0, 0]) if not reason_df.empty else "-"
+    top_reason_count = int(reason_df.iloc[0]["Order Count"]) if not reason_df.empty else 0
+    top_reason_pct = float(reason_df.iloc[0]["Pct"]) if not reason_df.empty else 0
 
-    if weekend_days and weekday_days:
-        diff_pct = pct(weekend_avg - weekday_avg, weekday_avg) if weekday_avg else 0
-        if weekend_avg > weekday_avg:
-            insight_1 = f"周末日均 <strong>{weekend_avg:.1f}单/天</strong>，比工作日 {weekday_avg:.1f}单/天 高 {diff_pct:.1f}%；但工作日绝对量为 <strong>{weekday_count}单</strong>，仍是主要治理场景。"
-        elif weekend_avg < weekday_avg:
-            insight_1 = f"工作日日均 <strong>{weekday_avg:.1f}单/天</strong>，高于周末 {weekend_avg:.1f}单/天；说明 cancel 主要压力集中在工作日运营链路。"
+    top_style = "-"
+    top_style_pct = 0
+    if not style_breakdown.empty:
+        top_style = str(style_breakdown.iloc[0]["Nail Style"])
+        top_style_pct = float(style_breakdown.iloc[0]["Pct"])
+
+    top_product = "-"
+    top_product_pct = 0
+    if not product_breakdown.empty:
+        top_product = str(product_breakdown.iloc[0]["Product Link / Product Name"])
+        top_product_pct = float(product_breakdown.iloc[0]["Pct"])
+
+    weekday_all = int((all_orders["Created Day Type"] == "工作日 Weekday").sum()) if not all_orders.empty else 0
+    weekend_all = total_orders - weekday_all
+    weekday_cancel = int((cancel_orders["Created Day Type"] == "工作日 Weekday").sum()) if not cancel_orders.empty else 0
+    weekend_cancel = cancel_orders_n - weekday_cancel
+
+    insights = []
+    insights.append(
+        f"本周期总订单 <strong>{fmt_num(total_orders)}</strong> 单，其中 Cancelled <strong>{fmt_num(cancel_orders_n)}</strong> 单，订单级 cancel 占比为 <strong>{cancel_rate:.1f}%</strong>。该口径已按 Order ID 去重，不受一个订单多个 SKU 行影响。"
+    )
+
+    if live_all or nonlive_all:
+        if live_cancel_rate > nonlive_cancel_rate:
+            diff = live_cancel_rate - nonlive_cancel_rate
+            insights.append(
+                f"按 <strong>Created Time</strong> 归因，直播时段创建订单的 cancel rate 为 <strong>{live_cancel_rate:.1f}%</strong>，非直播为 {nonlive_cancel_rate:.1f}%，直播购买链路高出 {diff:.1f} 个百分点。建议重点检查直播口播、价格预期、尺码解释和冲动下单后的反悔。"
+            )
         else:
-            insight_1 = f"工作日和周末日均 cancel 基本持平，工作日 {weekday_count}单、周末 {weekend_count}单；建议同时看直播时段和原因结构。"
-    else:
-        insight_1 = f"当前日期区间内共 <strong>{total}单</strong> cancel；日期范围较短，日均对比建议结合更长周期观察。"
+            insights.append(
+                f"按 <strong>Created Time</strong> 归因，直播时段创建订单的 cancel rate 为 <strong>{live_cancel_rate:.1f}%</strong>，非直播为 {nonlive_cancel_rate:.1f}%。当前数据不显示直播购买本身比非直播更容易取消，需继续看具体原因和产品链接。"
+            )
 
-    insight_2 = f"直播时段 cancel 占 <strong>{pct(live_count, total):.1f}%</strong>，聚合小时强度约为非直播的 <strong>{intensity_multiple:.1f}倍</strong>（直播 {live_intensity:.1f}单/小时 vs 非直播 {nonlive_intensity:.1f}单/小时）。"
+    insights.append(
+        f"Cancelled orders 的创建高峰在 <strong>{created_peak_label}</strong>（{fmt_num(created_peak_val)}单），实际取消动作高峰在 <strong>{cancel_peak_label}</strong>（{fmt_num(cancel_peak_val)}单）。Created Time 用于直播归因，Cancelled Time 仅用于判断顾客什么时候发起/完成取消。"
+    )
 
-    if live1_count >= live2_count:
-        insight_3 = f"直播①（{live1_start}:00–{live1_end}:00）贡献 <strong>{live1_count}单</strong>，高于直播②的 {live2_count}单；优先检查早/中场直播的促销说明、尺码讲解和下单引导。"
-    else:
-        insight_3 = f"直播②（{live2_start}:00–{live2_end}:00）贡献 <strong>{live2_count}单</strong>，高于直播①的 {live1_count}单；优先检查晚场直播的冲动下单、价格预期和支付链路。"
+    if top_reason != "-":
+        insights.append(
+            f"Top cancel reason 是 <strong>{html.escape(top_reason)}</strong>，共 {fmt_num(top_reason_count)} 单，占 {top_reason_pct:.1f}%。如果该原因连续多周第一，建议把它拆到直播话术、PDP 信息、结账页、客服拦截四个环节排查。"
+        )
 
-    insight_4 = f"Top cancel 原因为 <strong>{html.escape(top_reason)}</strong>，共 {top_reason_count}单，占 {top_reason_pct:.1f}%。如果该原因长期第一，需要把它拆到商品页、直播话术、结账页三个环节排查。"
+    if top_style != "-":
+        insights.append(
+            f"Cancelled SKU/甲型中占比最高的是 <strong>{html.escape(top_style)}</strong>，占 SKU 维度 {top_style_pct:.1f}%。建议结合该甲型的尺码选择、主图预期、价格折扣和是否直播强推一起看。"
+        )
 
-    rec_parts = [f"优先关注 <strong>{pk_label}</strong>（峰值 {pk_val}单）的下单后反悔/取消链路"]
-    if mistake_count:
-        rec_parts.append(f"针对 “Bought by mistake” 类原因（{mistake_count}单）增加直播口播二次确认、规格/尺码提醒、购物车检查提示")
-    if payment_count:
-        rec_parts.append(f"针对支付方式变更（{payment_count}单）优化结账前支付提醒")
-    if address_count:
-        rec_parts.append(f"针对地址问题（{address_count}单）加强下单前地址确认")
-    insight_5 = "；".join(rec_parts) + "。"
+    if top_product != "-":
+        insights.append(
+            f"H column 产品链接维度中，取消占比最高的是 <strong>{html.escape(top_product)}</strong>，占 SKU 维度 {top_product_pct:.1f}%。如果该链接长期集中，优先检查该链接的标题、图片、变体、优惠展示和库存/尺码选择。"
+        )
 
-    return [insight_1, insight_2, insight_3, insight_4, insight_5]
+    if weekday_all and weekend_all:
+        insights.append(
+            f"工作日 Created Time 订单 cancel rate 为 <strong>{pct(weekday_cancel, weekday_all):.1f}%</strong>，周末为 <strong>{pct(weekend_cancel, weekend_all):.1f}%</strong>。建议每周固定对比，判断问题更偏向工作日直播流量质量，还是周末冲动购买。"
+        )
 
-
-def build_report_context(df: pd.DataFrame, raw_rows: int, unique_orders_before_filter: int,
-                         source_name: str, start_date: date, end_date: date,
-                         live1_start: int, live1_end: int, live2_start: int, live2_end: int):
-    total = len(df)
-    total_days, weekday_days, weekend_days = calendar_day_counts(start_date, end_date)
-
-    weekday_df = df[df["Day Type"] == "工作日 Weekday"]
-    weekend_df = df[df["Day Type"] == "周末 Weekend"]
-    live1_df = df[df["Live Segment"] == "直播①"]
-    live2_df = df[df["Live Segment"] == "直播②"]
-    nonlive_df = df[df["Live Segment"] == "非直播"]
-
-    weekday_count = len(weekday_df)
-    weekend_count = len(weekend_df)
-    live_count = len(live1_df) + len(live2_df)
-    nonlive_count = len(nonlive_df)
-
-    wd_hour = hourly_counts(weekday_df)
-    we_hour = hourly_counts(weekend_df)
-    all_hour = hourly_counts(df)
-
-    wd_peak_label, wd_peak_val = peak_label(wd_hour)
-    we_peak_label, we_peak_val = peak_label(we_hour)
-
-    report_title = f"{start_date.strftime('%Y/%m/%d')}–{end_date.strftime('%Y/%m/%d')} 取消订单分析报告"
-    header_tag = f"Cancel Order Analytics · {start_date.strftime('%Y/%m/%d')}–{end_date.strftime('%Y/%m/%d')}"
-    range_label = f"{start_date.strftime('%Y/%m/%d')}–{end_date.strftime('%Y/%m/%d')}"
-
-    ctx = {
-        "total": total,
-        "raw_rows": raw_rows,
-        "unique_orders_before_filter": unique_orders_before_filter,
-        "source_name": source_name,
-        "report_title": report_title,
-        "header_tag": header_tag,
-        "range_label": range_label,
-        "start_date": start_date,
-        "end_date": end_date,
-        "total_days": total_days,
-        "weekday_days": weekday_days,
-        "weekend_days": weekend_days,
-        "weekday_count": weekday_count,
-        "weekend_count": weekend_count,
-        "weekday_avg": safe_div(weekday_count, weekday_days),
-        "weekend_avg": safe_div(weekend_count, weekend_days),
-        "live_count": live_count,
-        "nonlive_count": nonlive_count,
-        "live_pct": pct(live_count, total),
-        "nonlive_pct": pct(nonlive_count, total),
-        "wd_live_count": int(weekday_df["Is Live"].sum()) if weekday_count else 0,
-        "we_live_count": int(weekend_df["Is Live"].sum()) if weekend_count else 0,
-        "wd_nonlive_count": int((~weekday_df["Is Live"]).sum()) if weekday_count else 0,
-        "we_nonlive_count": int((~weekend_df["Is Live"]).sum()) if weekend_count else 0,
-        "wd_live_pct": pct(int(weekday_df["Is Live"].sum()) if weekday_count else 0, weekday_count),
-        "we_live_pct": pct(int(weekend_df["Is Live"].sum()) if weekend_count else 0, weekend_count),
-        "wd_hour": wd_hour,
-        "we_hour": we_hour,
-        "all_hour": all_hour,
-        "wd_peak_label": wd_peak_label,
-        "wd_peak_val": wd_peak_val,
-        "we_peak_label": we_peak_label,
-        "we_peak_val": we_peak_val,
-        "weekday_reasons": reason_table(weekday_df, 7),
-        "weekend_reasons": reason_table(weekend_df, 7),
-        "live1_reasons": reason_table(live1_df, 5),
-        "live2_reasons": reason_table(live2_df, 5),
-        "nonlive_reasons": reason_table(nonlive_df, 5),
-        "live1_count": len(live1_df),
-        "live2_count": len(live2_df),
-        "live1_start": live1_start,
-        "live1_end": live1_end,
-        "live2_start": live2_start,
-        "live2_end": live2_end,
-        "insights": make_insights(df, start_date, end_date, live1_start, live1_end, live2_start, live2_end),
-    }
-    return ctx
+    return insights[:7]
 
 
 def build_html_report(ctx):
-    wd_max = max(5, int(np.ceil(max(ctx["wd_hour"] + [1]) / 5.0) * 5))
-    we_max = max(5, int(np.ceil(max(ctx["we_hour"] + [1]) / 2.0) * 2))
-    all_max = max(5, int(np.ceil(max(ctx["all_hour"] + [1]) / 5.0) * 5))
+    created_max = max(5, int(np.ceil(max(ctx["created_hour_counts"] + [1]) / 5.0) * 5))
+    cancelled_max = max(5, int(np.ceil(max(ctx["cancelled_hour_counts"] + [1]) / 5.0) * 5))
 
-    insight_html = "\n".join(
-        f'''<div class="insight"><div class="insight-icon">// {str(i).zfill(2) if i < 5 else 'REC'}</div><div>{text}</div></div>'''
-        for i, text in enumerate(ctx["insights"], start=1)
+    insights_html = "\n".join(
+        f'''<div class="insight"><div class="insight-icon">// {str(i).zfill(2) if i < len(ctx['insights']) else 'REC'}</div><div>{txt}</div></div>'''
+        for i, txt in enumerate(ctx["insights"], start=1)
     )
-
-    chart_colors_js = f"""
-      function barColor(h){{
-        if(h>={ctx['live1_start']} && h<{ctx['live1_end']}) return '#d44a1e';
-        if(h>={ctx['live2_start']} && h<{ctx['live2_end']}) return '#c8840a';
-        return '#2d5fa8';
-      }}
-    """
 
     html_doc = f'''<!DOCTYPE html>
 <html lang="zh">
@@ -463,17 +511,17 @@ def build_html_report(ctx):
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <style>
   :root {{
-    --bg: #f7f7f5; --surface: #ffffff; --surface2: #f0f0ed; --border: rgba(0,0,0,0.08);
-    --text: #1a1a18; --text-muted: #5a5c63; --text-dim: #9a9ca3;
-    --live1: #d44a1e; --live2: #c8840a; --nonlive: #2d5fa8; --accent: #d44a1e; --green: #2a9e62;
-    --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC", "Microsoft YaHei", Arial, sans-serif;
-    --display: Georgia, "Times New Roman", serif;
+    --bg:#f7f7f5; --surface:#ffffff; --surface2:#f0f0ed; --border:rgba(0,0,0,0.08);
+    --text:#1a1a18; --text-muted:#5a5c63; --text-dim:#9a9ca3;
+    --live1:#d44a1e; --live2:#c8840a; --nonlive:#2d5fa8; --accent:#d44a1e; --green:#2a9e62; --purple:#7a4cc2;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans SC","Microsoft YaHei",Arial,sans-serif;
+    --display:Georgia,"Times New Roman",serif;
   }}
-  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-  body {{ background: var(--bg); color: var(--text); font-family: var(--sans); font-weight: 300; line-height: 1.6; min-height: 100vh; }}
-  header {{ border-bottom: 1px solid var(--border); padding: 48px 60px 40px; position: relative; overflow: hidden; }}
-  header::before {{ content:''; position:absolute; top:-80px; right:-80px; width:400px; height:400px; background:radial-gradient(circle, rgba(212,74,30,0.08) 0%, transparent 70%); pointer-events:none; }}
+  * {{ margin:0; padding:0; box-sizing:border-box; }}
+  body {{ background:var(--bg); color:var(--text); font-family:var(--sans); font-weight:300; line-height:1.6; min-height:100vh; }}
+  header {{ border-bottom:1px solid var(--border); padding:48px 60px 40px; position:relative; overflow:hidden; }}
+  header::before {{ content:''; position:absolute; top:-80px; right:-80px; width:400px; height:400px; background:radial-gradient(circle,rgba(212,74,30,0.08) 0%,transparent 70%); pointer-events:none; }}
   .header-tag {{ font-family:var(--mono); font-size:11px; color:var(--accent); letter-spacing:.15em; text-transform:uppercase; margin-bottom:14px; }}
   h1 {{ font-family:var(--display); font-size:48px; font-weight:700; line-height:1.15; color:var(--text); margin-bottom:10px; }}
   .header-sub {{ font-size:14px; color:var(--text-muted); letter-spacing:.02em; }}
@@ -486,16 +534,17 @@ def build_html_report(ctx):
   .stat-grid {{ display:grid; grid-template-columns:repeat(4,1fr); gap:1px; background:var(--border); border:1px solid var(--border); border-radius:8px; overflow:hidden; }}
   .stat {{ background:var(--surface); padding:24px 22px; position:relative; }}
   .stat::after {{ content:''; position:absolute; bottom:0; left:22px; right:22px; height:2px; border-radius:2px; }}
-  .stat.live1::after {{ background:var(--live1); }} .stat.live2::after {{ background:var(--live2); }} .stat.blue::after {{ background:var(--nonlive); }} .stat.green::after {{ background:var(--green); }}
+  .stat.red::after {{ background:var(--live1); }} .stat.green::after {{ background:var(--green); }} .stat.blue::after {{ background:var(--nonlive); }} .stat.amber::after {{ background:var(--live2); }} .stat.purple::after {{ background:var(--purple); }}
   .stat-lbl {{ font-family:var(--mono); font-size:10px; color:var(--text-muted); letter-spacing:.08em; margin-bottom:10px; }}
-  .stat-val {{ font-size:36px; font-weight:500; letter-spacing:-.03em; line-height:1; margin-bottom:6px; }}
-  .stat-val.orange {{ color:var(--live1); }} .stat-val.amber {{ color:var(--live2); }} .stat-val.blue {{ color:#6b9ddb; }} .stat-val.green {{ color:var(--green); }}
+  .stat-val {{ font-size:34px; font-weight:500; letter-spacing:-.03em; line-height:1; margin-bottom:6px; }}
+  .stat-val.red {{ color:var(--live1); }} .stat-val.green {{ color:var(--green); }} .stat-val.blue {{ color:#6b9ddb; }} .stat-val.amber {{ color:var(--live2); }} .stat-val.purple {{ color:var(--purple); }}
   .stat-sub {{ font-size:12px; color:var(--text-dim); }}
   .two-col {{ display:grid; grid-template-columns:1fr 1fr; gap:16px; }}
-  .panel, .full-panel {{ background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:24px; }}
+  .three-col {{ display:grid; grid-template-columns:repeat(3,1fr); gap:16px; }}
+  .panel,.full-panel {{ background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:24px; }}
   .panel-title {{ font-family:var(--mono); font-size:11px; color:var(--text-muted); letter-spacing:.1em; margin-bottom:18px; display:flex; align-items:center; gap:10px; flex-wrap:wrap; }}
   .badge {{ background:var(--surface2); border:1px solid var(--border); border-radius:4px; padding:2px 8px; font-size:10px; color:var(--text-dim); }}
-  .badge.r {{ border-color:rgba(232,87,42,.3); color:var(--live1); }} .badge.y {{ border-color:rgba(240,167,66,.3); color:var(--live2); }}
+  .badge.r {{ border-color:rgba(232,87,42,.3); color:var(--live1); }} .badge.y {{ border-color:rgba(240,167,66,.3); color:var(--live2); }} .badge.b {{ border-color:rgba(45,95,168,.3); color:var(--nonlive); }}
   .mini-stats {{ display:flex; gap:8px; margin-top:14px; }}
   .mini-stat {{ flex:1; background:var(--surface2); border-radius:6px; padding:10px 12px; text-align:center; }}
   .mini-stat-lbl {{ font-size:10px; color:var(--text-dim); margin-bottom:3px; }} .mini-stat-val {{ font-size:18px; font-weight:500; color:var(--text); }} .mini-stat-sub {{ font-size:10px; color:var(--text-dim); margin-top:2px; }}
@@ -503,309 +552,396 @@ def build_html_report(ctx):
   .legend {{ display:flex; gap:16px; margin-bottom:12px; flex-wrap:wrap; }}
   .legend-item {{ display:flex; align-items:center; gap:6px; font-size:11px; color:var(--text-muted); }}
   .legend-dot {{ width:10px; height:10px; border-radius:2px; flex-shrink:0; }}
-  .reason-list {{ margin-top:4px; }}
-  .reason-row {{ display:flex; align-items:center; gap:10px; padding:7px 0; border-bottom:1px solid var(--border); font-size:12px; }}
-  .reason-row:last-child {{ border-bottom:none; }}
-  .reason-name {{ flex:1; color:var(--text-muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
-  .reason-bar-wrap {{ width:80px; height:4px; background:var(--surface2); border-radius:2px; overflow:hidden; }}
-  .reason-bar {{ height:100%; border-radius:2px; }}
-  .reason-cnt {{ font-family:var(--mono); font-size:11px; color:var(--text); min-width:26px; text-align:right; }}
-  .reason-pct {{ font-family:var(--mono); font-size:10px; color:var(--text-dim); min-width:42px; text-align:right; }}
-  .live-grid {{ display:grid; grid-template-columns:repeat(3,1fr); gap:16px; }}
-  .live-panel {{ background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:20px; position:relative; overflow:hidden; }}
-  .live-panel::before {{ content:''; position:absolute; top:0; left:0; right:0; height:3px; }}
-  .live-panel.s1::before {{ background:var(--live1); }} .live-panel.s2::before {{ background:var(--live2); }} .live-panel.s3::before {{ background:var(--nonlive); }}
-  .live-title {{ font-family:var(--mono); font-size:10px; color:var(--text-dim); letter-spacing:.1em; margin-bottom:4px; }}
-  .live-count {{ font-size:30px; font-weight:500; letter-spacing:-.03em; margin-bottom:14px; }}
-  .live-panel.s1 .live-count {{ color:var(--live1); }} .live-panel.s2 .live-count {{ color:var(--live2); }} .live-panel.s3 .live-count {{ color:#6b9ddb; }}
-  .insights {{ display:flex; flex-direction:column; gap:10px; }}
+  .reason-row,.break-row {{ display:flex; align-items:center; gap:10px; padding:7px 0; border-bottom:1px solid var(--border); font-size:12px; }}
+  .reason-row:last-child,.break-row:last-child {{ border-bottom:none; }}
+  .reason-name,.break-name {{ flex:1; color:var(--text-muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
+  .reason-bar-wrap,.break-bar-wrap {{ width:86px; height:4px; background:var(--surface2); border-radius:2px; overflow:hidden; }}
+  .reason-bar,.break-bar {{ height:100%; border-radius:2px; }}
+  .reason-cnt,.break-num {{ font-family:var(--mono); font-size:11px; color:var(--text); min-width:38px; text-align:right; }}
+  .reason-pct,.break-pct {{ font-family:var(--mono); font-size:10px; color:var(--text-dim); min-width:42px; text-align:right; }}
+  .break-orders {{ font-family:var(--mono); font-size:10px; color:var(--text-dim); min-width:72px; text-align:right; }}
+  .insights {{ display:flex; flex-direction:column; gap:10px; margin-top:0; }}
   .insight {{ background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:16px 20px; font-size:13px; color:var(--text-muted); line-height:1.7; display:flex; gap:14px; align-items:flex-start; }}
   .insight-icon {{ font-family:var(--mono); font-size:10px; color:var(--accent); letter-spacing:.05em; flex-shrink:0; padding-top:3px; }}
   .insight strong {{ color:var(--text); font-weight:500; }}
-  .empty-note {{ font-size:12px; color:var(--text-dim); padding:8px 0; }}
-  footer {{ border-top:1px solid var(--border); margin:0 60px; padding:24px 0; font-family:var(--mono); font-size:10px; color:var(--text-dim); display:flex; justify-content:space-between; gap:20px; }}
+  footer {{ border-top:1px solid var(--border); margin:0 60px; padding:24px 0; font-family:var(--mono); font-size:10px; color:var(--text-dim); display:flex; justify-content:space-between; gap:16px; }}
+  .empty-note {{ font-size:12px; color:var(--text-dim); padding:12px 0; }}
   @keyframes fadeUp {{ from {{ opacity:0; transform:translateY(16px); }} to {{ opacity:1; transform:translateY(0); }} }}
-  @media (max-width: 900px) {{ header, main {{ padding-left:24px; padding-right:24px; }} .header-meta {{ position:static; text-align:left; margin-top:20px; }} .stat-grid, .two-col, .live-grid {{ grid-template-columns:1fr; }} footer {{ margin:0 24px; flex-direction:column; }} }}
 </style>
 </head>
 <body>
 <header>
-  <div class="header-tag">{html.escape(ctx['header_tag'])}</div>
+  <div class="header-tag">Cancel Order Analytics · {html.escape(ctx['range_label'])}</div>
   <h1>取消订单<br>分析报告</h1>
-  <p class="header-sub">工作日 vs 周末 · 直播时段重合分析 · 原因拆解 · Order ID 去重口径</p>
-  <div class="header-meta"><strong>{ctx['total']}</strong>去重订单总量<br>{html.escape(ctx['range_label'])}</div>
+  <p class="header-sub">订单总表清洗 · Order ID 去重 · Created Time 直播归因 · SKU/甲型与产品链接拆解</p>
+  <div class="header-meta">
+    <strong>{fmt_num(ctx['cancel_orders'])}</strong>
+    Cancelled Orders<br>
+    占总订单 {ctx['cancel_rate']:.1f}%
+  </div>
 </header>
-
 <main>
   <div class="section">
     <div class="section-label"><span>01</span>总览 Overview</div>
     <div class="stat-grid">
-      <div class="stat live1"><div class="stat-lbl">工作日 Weekday</div><div class="stat-val orange">{ctx['weekday_count']}</div><div class="stat-sub">{ctx['weekday_days']}天 · 均 {ctx['weekday_avg']:.1f}单/天</div></div>
-      <div class="stat green"><div class="stat-lbl">周末 Weekend</div><div class="stat-val green">{ctx['weekend_count']}</div><div class="stat-sub">{ctx['weekend_days']}天 · 均 {ctx['weekend_avg']:.1f}单/天</div></div>
-      <div class="stat live2"><div class="stat-lbl">直播时段 cancel</div><div class="stat-val amber">{ctx['live_count']}</div><div class="stat-sub">占总量 {ctx['live_pct']:.1f}%</div></div>
-      <div class="stat blue"><div class="stat-lbl">非直播时段 cancel</div><div class="stat-val blue">{ctx['nonlive_count']}</div><div class="stat-sub">占总量 {ctx['nonlive_pct']:.1f}%</div></div>
+      <div class="stat green"><div class="stat-lbl">总订单 Total Orders</div><div class="stat-val green">{fmt_num(ctx['total_orders'])}</div><div class="stat-sub">按 Order ID 去重</div></div>
+      <div class="stat red"><div class="stat-lbl">Cancelled Orders</div><div class="stat-val red">{fmt_num(ctx['cancel_orders'])}</div><div class="stat-sub">B column Order Status = Cancelled/Canceled</div></div>
+      <div class="stat amber"><div class="stat-lbl">Cancel Rate</div><div class="stat-val amber">{ctx['cancel_rate']:.1f}%</div><div class="stat-sub">Cancelled / Total Orders</div></div>
+      <div class="stat blue"><div class="stat-lbl">Cancelled SKU Units</div><div class="stat-val blue">{fmt_num(ctx['cancel_sku_metric'])}</div><div class="stat-sub">{html.escape(ctx['metric_label'])}</div></div>
     </div>
   </div>
 
   <div class="section">
-    <div class="section-label"><span>02</span>工作日 vs 周末 · 每小时 Cancel 分布</div>
+    <div class="section-label"><span>02</span>直播购买归因 · Based on Created Time</div>
+    <div class="stat-grid">
+      <div class="stat red"><div class="stat-lbl">直播① Cancelled</div><div class="stat-val red">{fmt_num(ctx['live1_cancel'])}</div><div class="stat-sub">{ctx['live1_start']}:00–{ctx['live1_end']}:00 · 占 cancelled {fmt_pct(ctx['live1_cancel'], ctx['cancel_orders'])}</div></div>
+      <div class="stat amber"><div class="stat-lbl">直播② Cancelled</div><div class="stat-val amber">{fmt_num(ctx['live2_cancel'])}</div><div class="stat-sub">{ctx['live2_start']}:00–{ctx['live2_end']}:00 · 占 cancelled {fmt_pct(ctx['live2_cancel'], ctx['cancel_orders'])}</div></div>
+      <div class="stat blue"><div class="stat-lbl">非直播 Cancelled</div><div class="stat-val blue">{fmt_num(ctx['nonlive_cancel'])}</div><div class="stat-sub">Created Time 不在直播时段</div></div>
+      <div class="stat purple"><div class="stat-lbl">直播创建订单 Cancel Rate</div><div class="stat-val purple">{ctx['live_cancel_rate']:.1f}%</div><div class="stat-sub">非直播 {ctx['nonlive_cancel_rate']:.1f}%</div></div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-label"><span>03</span>Created Time vs Cancelled Time · 每小时分布</div>
     <div class="two-col">
       <div class="panel">
-        <div class="panel-title">工作日 · {ctx['weekday_count']}单 <span class="badge r">直播 {ctx['wd_live_pct']:.1f}%</span></div>
-        <div class="legend"><div class="legend-item"><div class="legend-dot" style="background:var(--live1)"></div>直播① {ctx['live1_start']}–{ctx['live1_end']}点</div><div class="legend-item"><div class="legend-dot" style="background:var(--live2)"></div>直播② {ctx['live2_start']}–{ctx['live2_end']}点</div><div class="legend-item"><div class="legend-dot" style="background:var(--nonlive)"></div>非直播</div></div>
-        <div class="chart-wrap" style="height:180px"><canvas id="wdHour"></canvas></div>
-        <div class="mini-stats"><div class="mini-stat"><div class="mini-stat-lbl">直播时段</div><div class="mini-stat-val" style="color:var(--live1)">{ctx['wd_live_count']}单</div><div class="mini-stat-sub">{ctx['wd_live_pct']:.1f}%</div></div><div class="mini-stat"><div class="mini-stat-lbl">非直播</div><div class="mini-stat-val">{ctx['wd_nonlive_count']}单</div><div class="mini-stat-sub">{pct(ctx['wd_nonlive_count'], ctx['weekday_count']):.1f}%</div></div><div class="mini-stat"><div class="mini-stat-lbl">峰值时段</div><div class="mini-stat-val" style="color:var(--live1)">{ctx['wd_peak_label']}</div><div class="mini-stat-sub">{ctx['wd_peak_val']}单</div></div></div>
+        <div class="panel-title">Cancelled Orders 的创建时间 <span class="badge r">用于直播归因</span></div>
+        <div class="legend"><div class="legend-item"><div class="legend-dot" style="background:var(--live1)"></div>直播①</div><div class="legend-item"><div class="legend-dot" style="background:var(--live2)"></div>直播②</div><div class="legend-item"><div class="legend-dot" style="background:var(--nonlive)"></div>非直播</div></div>
+        <div class="chart-wrap" style="height:210px"><canvas id="createdHour"></canvas></div>
+        <div class="mini-stats"><div class="mini-stat"><div class="mini-stat-lbl">创建峰值</div><div class="mini-stat-val" style="color:var(--live1)">{ctx['created_peak_label']}</div><div class="mini-stat-sub">{fmt_num(ctx['created_peak_val'])}单</div></div><div class="mini-stat"><div class="mini-stat-lbl">直播归因占比</div><div class="mini-stat-val">{fmt_pct(ctx['live_cancel'], ctx['cancel_orders'])}</div><div class="mini-stat-sub">按 Created Time</div></div></div>
       </div>
       <div class="panel">
-        <div class="panel-title">周末 · {ctx['weekend_count']}单 <span class="badge y">直播 {ctx['we_live_pct']:.1f}%</span></div>
-        <div class="legend"><div class="legend-item"><div class="legend-dot" style="background:var(--live1)"></div>直播① {ctx['live1_start']}–{ctx['live1_end']}点</div><div class="legend-item"><div class="legend-dot" style="background:var(--live2)"></div>直播② {ctx['live2_start']}–{ctx['live2_end']}点</div><div class="legend-item"><div class="legend-dot" style="background:var(--nonlive)"></div>非直播</div></div>
-        <div class="chart-wrap" style="height:180px"><canvas id="weHour"></canvas></div>
-        <div class="mini-stats"><div class="mini-stat"><div class="mini-stat-lbl">直播时段</div><div class="mini-stat-val" style="color:var(--live1)">{ctx['we_live_count']}单</div><div class="mini-stat-sub">{ctx['we_live_pct']:.1f}%</div></div><div class="mini-stat"><div class="mini-stat-lbl">非直播</div><div class="mini-stat-val">{ctx['we_nonlive_count']}单</div><div class="mini-stat-sub">{pct(ctx['we_nonlive_count'], ctx['weekend_count']):.1f}%</div></div><div class="mini-stat"><div class="mini-stat-lbl">峰值时段</div><div class="mini-stat-val" style="color:var(--live1)">{ctx['we_peak_label']}</div><div class="mini-stat-sub">{ctx['we_peak_val']}单</div></div></div>
+        <div class="panel-title">实际取消时间 <span class="badge b">仅看 Cancelled Time 峰值</span></div>
+        <div class="chart-wrap" style="height:210px"><canvas id="cancelledHour"></canvas></div>
+        <div class="mini-stats"><div class="mini-stat"><div class="mini-stat-lbl">取消峰值</div><div class="mini-stat-val" style="color:var(--nonlive)">{ctx['cancelled_peak_label']}</div><div class="mini-stat-sub">{fmt_num(ctx['cancelled_peak_val'])}单</div></div><div class="mini-stat"><div class="mini-stat-lbl">缺失 Cancelled Time</div><div class="mini-stat-val">{fmt_num(ctx['missing_cancelled_time'])}</div><div class="mini-stat-sub">不进入右图</div></div></div>
       </div>
     </div>
   </div>
 
   <div class="section">
-    <div class="section-label"><span>03</span>取消原因对比 · 工作日 vs 周末</div>
-    <div class="two-col">
-      <div class="panel"><div class="panel-title">工作日 Top 原因</div><div class="reason-list">{make_reason_rows(ctx['weekday_reasons'], 'var(--live1)')}</div></div>
-      <div class="panel"><div class="panel-title">周末 Top 原因</div><div class="reason-list">{make_reason_rows(ctx['weekend_reasons'], 'var(--live2)')}</div></div>
+    <div class="section-label"><span>04</span>取消原因 Cancel Reason</div>
+    <div class="full-panel">
+      {make_reason_rows(ctx['reason_df'], 'var(--live1)')}
     </div>
   </div>
 
   <div class="section">
-    <div class="section-label"><span>04</span>直播时段 Cancel 深度拆分</div>
-    <div class="live-grid">
-      <div class="live-panel s1"><div class="live-title">直播① · {ctx['live1_start']}:00–{ctx['live1_end']}:00</div><div class="live-count">{ctx['live1_count']}单</div><div class="reason-list">{make_reason_rows(ctx['live1_reasons'], 'var(--live1)')}</div></div>
-      <div class="live-panel s2"><div class="live-title">直播② · {ctx['live2_start']}:00–{ctx['live2_end']}:00</div><div class="live-count">{ctx['live2_count']}单</div><div class="reason-list">{make_reason_rows(ctx['live2_reasons'], 'var(--live2)')}</div></div>
-      <div class="live-panel s3"><div class="live-title">非直播 · 其余时段</div><div class="live-count">{ctx['nonlive_count']}单</div><div class="reason-list">{make_reason_rows(ctx['nonlive_reasons'], 'var(--nonlive)')}</div></div>
+    <div class="section-label"><span>05</span>Cancelled Orders · 甲型 / SKU Breakdown</div>
+    <div class="full-panel">
+      <div class="panel-title">各个甲型个数和占比 <span class="badge r">{html.escape(ctx['metric_label'])}</span></div>
+      {make_breakdown_rows(ctx['style_breakdown'], 'Nail Style', ctx['metric_col'], 'var(--live1)')}
     </div>
   </div>
 
   <div class="section">
-    <div class="section-label"><span>05</span>全天 Cancel 时段分布（所有订单合并）</div>
-    <div class="full-panel"><div class="legend" style="margin-bottom:16px"><div class="legend-item"><div class="legend-dot" style="background:var(--live1)"></div>直播① {ctx['live1_start']}–{ctx['live1_end']}点</div><div class="legend-item"><div class="legend-dot" style="background:var(--live2)"></div>直播② {ctx['live2_start']}–{ctx['live2_end']}点</div><div class="legend-item"><div class="legend-dot" style="background:var(--nonlive)"></div>非直播时段</div></div><div class="chart-wrap" style="height:220px"><canvas id="allHour"></canvas></div></div>
+    <div class="section-label"><span>06</span>Cancelled Orders · H Column 产品链接 Breakdown</div>
+    <div class="full-panel">
+      <div class="panel-title">各个产品链接 / Product Name 个数和占比 <span class="badge b">H column</span></div>
+      {make_breakdown_rows(ctx['product_breakdown'], 'Product Link / Product Name', ctx['metric_col'], 'var(--nonlive)')}
+    </div>
   </div>
 
   <div class="section">
-    <div class="section-label"><span>06</span>关键洞察 Key Insights</div>
-    <div class="insights">{insight_html}</div>
+    <div class="section-label"><span>07</span>关键洞察 Key Insights</div>
+    <div class="insights">{insights_html}</div>
   </div>
 </main>
-
 <footer>
-  <span>数据来源：{html.escape(ctx['source_name'])} · 原始 {ctx['raw_rows']} 行 SKU 明细 · 去重后 {ctx['unique_orders_before_filter']} 个 Order ID</span>
-  <span>直播时段定义：{ctx['live1_start']}:00–{ctx['live1_end']}:00 / {ctx['live2_start']}:00–{ctx['live2_end']}:00；去重口径：Order ID 唯一</span>
+  <span>数据来源：{html.escape(ctx['source_name'])} · 日期口径：Created Time · 订单口径：Order ID unique</span>
+  <span>直播归因：Created Time in {ctx['live1_start']}:00–{ctx['live1_end']}:00 / {ctx['live2_start']}:00–{ctx['live2_end']}:00</span>
 </footer>
-
 <script>
 const C = Chart;
 const hrs = Array.from({{length:24}},(_,i)=>i);
-{chart_colors_js}
+function barColor(h){{
+  if(h>={ctx['live1_start']} && h<{ctx['live1_end']}) return '#d44a1e';
+  if(h>={ctx['live2_start']} && h<{ctx['live2_end']}) return '#c8840a';
+  return '#2d5fa8';
+}}
 const colors = hrs.map(barColor);
-const commonOpts = (max, step) => ({{responsive:true, maintainAspectRatio:false, plugins:{{legend:{{display:false}}}}, scales:{{x:{{ticks:{{autoSkip:false,maxRotation:0,font:{{size:9}},color:'#9a9ca3'}},grid:{{color:'rgba(0,0,0,0.05)'}},border:{{color:'rgba(0,0,0,0.08)'}}}}, y:{{beginAtZero:true, max:max, ticks:{{stepSize:step,font:{{size:10}},color:'#9a9ca3'}}, grid:{{color:'rgba(0,0,0,0.05)'}}, border:{{color:'rgba(0,0,0,0.08)'}}}}}}}});
-new C(document.getElementById('wdHour'), {{type:'bar', data:{{labels:hrs.map(h=>h+'h'), datasets:[{{data:{json.dumps(ctx['wd_hour'])}, backgroundColor:colors, borderRadius:3}}]}}, options:commonOpts({wd_max}, {max(1, wd_max//5)})}});
-new C(document.getElementById('weHour'), {{type:'bar', data:{{labels:hrs.map(h=>h+'h'), datasets:[{{data:{json.dumps(ctx['we_hour'])}, backgroundColor:colors, borderRadius:3}}]}}, options:commonOpts({we_max}, {max(1, we_max//5)})}});
-new C(document.getElementById('allHour'), {{type:'bar', data:{{labels:hrs.map(h=>h+'h'), datasets:[{{data:{json.dumps(ctx['all_hour'])}, backgroundColor:colors, borderRadius:3}}]}}, options:commonOpts({all_max}, {max(1, all_max//5)})}});
+function commonOpts(maxVal, step){{
+  return {{ responsive:true, maintainAspectRatio:false, plugins:{{ legend:{{display:false}} }},
+    scales:{{
+      x:{{ ticks:{{autoSkip:false,maxRotation:0,font:{{size:9}},color:'#9a9ca3'}}, grid:{{color:'rgba(0,0,0,0.05)'}}, border:{{color:'rgba(0,0,0,0.08)'}} }},
+      y:{{ beginAtZero:true, max:maxVal, ticks:{{stepSize:step,font:{{size:10}},color:'#9a9ca3'}}, grid:{{color:'rgba(0,0,0,0.05)'}}, border:{{color:'rgba(0,0,0,0.08)'}} }}
+    }}
+  }};
+}}
+new C(document.getElementById('createdHour'), {{
+  type:'bar',
+  data:{{ labels:hrs.map(h=>h+'h'), datasets:[{{ data:{json.dumps(ctx['created_hour_counts'])}, backgroundColor:colors, borderRadius:3 }}] }},
+  options:commonOpts({created_max}, {5 if created_max >= 10 else 1})
+}});
+new C(document.getElementById('cancelledHour'), {{
+  type:'bar',
+  data:{{ labels:hrs.map(h=>h+'h'), datasets:[{{ data:{json.dumps(ctx['cancelled_hour_counts'])}, backgroundColor:'#2d5fa8', borderRadius:3 }}] }},
+  options:commonOpts({cancelled_max}, {5 if cancelled_max >= 10 else 1})
+}});
 </script>
 </body>
 </html>'''
     return html_doc
 
 
-def make_excel_download(order_df: pd.DataFrame, analysis_df: pd.DataFrame, ctx: dict) -> bytes:
+def make_excel_download(all_orders, cancel_orders, cancel_lines, style_breakdown, product_breakdown, reason_df, ctx) -> bytes:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         summary = pd.DataFrame([
-            ["原始 SKU 行数", ctx["raw_rows"]],
-            ["去重 Order ID 数", ctx["unique_orders_before_filter"]],
-            ["当前日期区间 cancel 单数", ctx["total"]],
-            ["工作日 cancel", ctx["weekday_count"]],
-            ["周末 cancel", ctx["weekend_count"]],
-            ["直播时段 cancel", ctx["live_count"]],
-            ["非直播时段 cancel", ctx["nonlive_count"]],
-            ["直播时段占比", f"{ctx['live_pct']:.1f}%"],
+            ["Date Range", ctx["range_label"]],
+            ["Total Orders", ctx["total_orders"]],
+            ["Cancelled Orders", ctx["cancel_orders"]],
+            ["Cancel Rate", f"{ctx['cancel_rate']:.1f}%"],
+            ["Cancelled SKU Units", ctx["cancel_sku_metric"]],
+            ["Metric", ctx["metric_label"]],
+            ["Live Cancelled by Created Time", ctx["live_cancel"]],
+            ["Non-live Cancelled by Created Time", ctx["nonlive_cancel"]],
+            ["Live Created Order Cancel Rate", f"{ctx['live_cancel_rate']:.1f}%"],
+            ["Non-live Created Order Cancel Rate", f"{ctx['nonlive_cancel_rate']:.1f}%"],
         ], columns=["Metric", "Value"])
         summary.to_excel(writer, index=False, sheet_name="Summary")
-
-        reason_all = analysis_df["Cancel Reason Clean"].value_counts().reset_index()
-        reason_all.columns = ["Cancel Reason", "Order Count"]
-        reason_all["Share"] = reason_all["Order Count"] / max(1, len(analysis_df))
-        reason_all.to_excel(writer, index=False, sheet_name="Reason Breakdown")
-
-        hour_all = pd.DataFrame({
+        all_orders.to_excel(writer, index=False, sheet_name="Order Level All")
+        cancel_orders.to_excel(writer, index=False, sheet_name="Cancelled Orders")
+        cancel_lines.to_excel(writer, index=False, sheet_name="Cancelled SKU Lines")
+        style_breakdown.to_excel(writer, index=False, sheet_name="Nail Style Breakdown")
+        product_breakdown.to_excel(writer, index=False, sheet_name="Product Link Breakdown")
+        reason_df.to_excel(writer, index=False, sheet_name="Cancel Reasons")
+        pd.DataFrame({
             "Hour": list(range(24)),
-            "All Orders": ctx["all_hour"],
-            "Weekday": ctx["wd_hour"],
-            "Weekend": ctx["we_hour"],
-        })
-        hour_all.to_excel(writer, index=False, sheet_name="Hourly Breakdown")
+            "Cancelled Orders Created Time": ctx["created_hour_counts"],
+            "Cancelled Orders Cancelled Time": ctx["cancelled_hour_counts"],
+        }).to_excel(writer, index=False, sheet_name="Hourly")
 
-        export_cols = [c for c in ["Order ID", "Cancelled Datetime", "Created Datetime", "Cancel Reason", "Cancel Reason Clean", "Day Type", "Live Segment", "Hour", "SKU Count", "Item Quantity", "Seller SKU", "Variation", "Order Amount Parsed", "Order Refund Amount Parsed", "Payment Method", "State", "Country"] if c in analysis_df.columns]
-        analysis_df[export_cols].to_excel(writer, index=False, sheet_name="Cleaned Orders")
+        workbook = writer.book
+        header_fmt = workbook.add_format({"bold": True, "bg_color": "#F3F4F6", "border": 1})
+        for sheet in writer.sheets.values():
+            sheet.freeze_panes(1, 0)
+            sheet.set_row(0, None, header_fmt)
+            sheet.set_column(0, 0, 26)
+            sheet.set_column(1, 20, 18)
     return output.getvalue()
 
 
 # =========================
-# UI
+# Streamlit UI
 # =========================
-st.title("📉 Cancel Order Report Generator")
-st.caption("上传 TikTok Shop cancelled orders 明细表后，自动按 Order ID 去重，并生成与示例附件同结构的取消订单分析报告。")
+st.title("💅 Cancelled Orders Report Generator")
+st.caption("上传 TikTok Shop 订单总表，程序会自动清洗出 B column `Order Status = Cancelled/Canceled` 的订单，并按 Order ID 去重生成报告。")
 
-uploaded_file = st.file_uploader("上传 Cancelled Orders 详情表（CSV / Excel）", type=["csv", "xlsx", "xls"])
+with st.expander("这版程序的核心口径", expanded=True):
+    st.markdown(
+        """
+- **上传文件**：订单总表，不再上传 cancelled order 表。
+- **Cancelled 识别**：B column `Order Status` 等于 `Cancelled` 或 `Canceled`。
+- **订单口径**：一个 `Order ID` 只算一个订单；一个 `Order ID` 只算一个 cancelled order。
+- **直播归因**：使用 **AB column `Created Time`** 判断是否属于直播间购买，而不是 `Cancelled Time`。
+- **取消峰值**：使用 `Cancelled Time` 单独分析“顾客什么时候取消”，但它不用于直播归因。
+- **甲型 / 产品链接拆解**：基于 cancelled orders 对应的 SKU 行做统计，因为一个订单可能有多个 SKU。
+        """
+    )
 
-with st.sidebar:
-    st.header("报告设置")
-    st.caption("默认口径：一个 Order ID = 一个 cancel。")
-    live1_start = st.number_input("直播①开始小时", min_value=0, max_value=23, value=10, step=1)
-    live1_end = st.number_input("直播①结束小时（不含）", min_value=1, max_value=24, value=18, step=1)
-    live2_start = st.number_input("直播②开始小时", min_value=0, max_value=23, value=19, step=1)
-    live2_end = st.number_input("直播②结束小时（不含）", min_value=1, max_value=24, value=23, step=1)
-    top_n = st.slider("页面表格展示 Top N 原因", 3, 12, 7, 1)
-    show_cleaned = st.checkbox("显示订单级明细预览", value=True)
+uploaded_file = st.file_uploader("上传订单总表 CSV / Excel", type=["csv", "xlsx", "xls"])
 
 if uploaded_file is None:
-    st.info("请先上传一份 TikTok Shop cancelled orders 详情表。")
-    st.markdown("""
-**程序会自动完成：**
-1. 读取未清洗表格；
-2. 以 `Order ID` 去重，把一行一个 SKU 的明细聚合为一行一个订单；
-3. 使用 `Cancelled Time` 判断日期、小时、工作日/周末和直播时段；
-4. 使用 `Cancel Reason` 统计原因占比；
-5. 生成 HTML 报告、清洗后的订单级 Excel。
-""")
+    st.info("请先上传 TikTok Shop 导出的订单总表。")
     st.stop()
 
 try:
     raw = read_uploaded_file(uploaded_file)
-    raw.columns = [clean_column_name(c) for c in raw.columns]
 except Exception as e:
     st.error(f"文件读取失败：{e}")
     st.stop()
 
-st.subheader("1）字段识别")
-cols = raw.columns.tolist()
-
-if "Order ID" not in cols:
-    st.error("没有识别到 `Order ID` 字段。请确认上传的是 TikTok Shop cancelled orders 明细表。")
+raw.columns = [clean_column_name(c) for c in raw.columns]
+missing = validate_columns(raw)
+if missing:
+    st.error("缺少必要字段：" + ", ".join(missing))
+    st.write("当前识别到的字段：", list(raw.columns))
     st.stop()
 
-col1, col2, col3 = st.columns(3)
-with col1:
-    order_id_col = st.selectbox("Order ID 字段", cols, index=cols.index("Order ID"))
-with col2:
-    default_time = "Cancelled Time" if "Cancelled Time" in cols else next((c for c in cols if "Time" in c), cols[0])
-    time_col_raw = st.selectbox("用于分析的时间字段", cols, index=cols.index(default_time))
-with col3:
-    default_reason = "Cancel Reason" if "Cancel Reason" in cols else next((c for c in cols if "Reason" in c), cols[0])
-    reason_col = st.selectbox("取消原因字段", cols, index=cols.index(default_reason))
+with st.sidebar:
+    st.header("Report Settings")
+    st.caption("日期筛选默认使用 Created Time，因为总订单和直播归因都应该按下单创建时间判断。")
 
-order_df = build_order_level(raw, order_id_col)
+    metric_mode_label = st.radio(
+        "甲型 / 产品链接统计口径",
+        options=["按 Quantity 汇总（推荐）", "按 SKU 行数汇总"],
+        index=0,
+        help="如果同一 SKU 行 Quantity > 1，按 Quantity 汇总会更接近实际件数；按 SKU 行数则一行算 1。",
+    )
+    metric_mode = "quantity" if metric_mode_label.startswith("按 Quantity") else "rows"
 
-# Normalize the selected time column to the order-level parsed column if possible.
-parsed_candidate = f"__parsed_{time_col_raw}"
-if time_col_raw == "Cancelled Time" and "Cancelled Datetime" in order_df.columns:
-    time_col = "Cancelled Datetime"
-elif time_col_raw == "Created Time" and "Created Datetime" in order_df.columns:
-    time_col = "Created Datetime"
-elif time_col_raw == "Paid Time" and "Paid Datetime" in order_df.columns:
-    time_col = "Paid Datetime"
-elif parsed_candidate in order_df.columns:
-    order_df[time_col_raw + " Parsed"] = order_df[parsed_candidate]
-    time_col = time_col_raw + " Parsed"
+    live1_col, live2_col = st.columns(2)
+    with live1_col:
+        live1_start = st.number_input("直播①开始", min_value=0, max_value=23, value=10, step=1)
+        live1_end = st.number_input("直播①结束", min_value=1, max_value=24, value=18, step=1)
+    with live2_col:
+        live2_start = st.number_input("直播②开始", min_value=0, max_value=23, value=19, step=1)
+        live2_end = st.number_input("直播②结束", min_value=1, max_value=24, value=23, step=1)
+
+    top_n = st.slider("Breakdown 显示 Top N", min_value=5, max_value=30, value=10, step=1)
+
+if not (live1_start < live1_end and live2_start < live2_end):
+    st.error("直播开始时间必须小于结束时间。")
+    st.stop()
+
+lines = prepare_line_level(raw, metric_mode=metric_mode)
+missing_created = int(lines["Created Datetime"].isna().sum())
+valid_created = lines[lines["Created Datetime"].notna()].copy()
+if valid_created.empty:
+    st.error("Created Time 无法解析，无法继续。请检查 AB column Created Time 格式。")
+    st.stop()
+
+min_date = valid_created["Created Datetime"].dt.date.min()
+max_date = valid_created["Created Datetime"].dt.date.max()
+
+with st.sidebar:
+    date_range = st.date_input(
+        "选择 Created Time 日期区间",
+        value=(min_date, max_date),
+        min_value=min_date,
+        max_value=max_date,
+    )
+
+if isinstance(date_range, tuple) and len(date_range) == 2:
+    start_date, end_date = date_range
 else:
-    order_df[time_col_raw + " Parsed"] = parse_datetime_series(order_df[time_col_raw]) if time_col_raw in order_df.columns else pd.NaT
-    time_col = time_col_raw + " Parsed"
+    start_date = end_date = date_range
 
-if reason_col not in order_df.columns:
-    # If grouped under the same name was not carried through for some reason, create Unknown.
-    order_df[reason_col] = "Unknown"
-
-valid_dates = order_df[time_col].dropna()
-if len(valid_dates) == 0:
-    st.error(f"`{time_col_raw}` 无法解析出有效日期，请换一个时间字段或检查表格格式。")
+selected_lines = filter_by_created_date(lines, start_date, end_date)
+if selected_lines.empty:
+    st.warning("当前日期区间内没有订单。")
     st.stop()
 
-min_date = valid_dates.dt.date.min()
-max_date = valid_dates.dt.date.max()
+all_orders = build_order_level(selected_lines, live1_start, live1_end, live2_start, live2_end)
+cancel_orders = all_orders[all_orders["Is Cancelled"]].copy()
+cancel_order_ids = set(cancel_orders["Order ID"])
+cancel_lines = selected_lines[selected_lines["Order ID"].isin(cancel_order_ids)].copy()
 
-st.subheader("2）日期区间")
-st.caption("如果导出的周/月区间首尾没有 cancel，建议手动把日期改成完整周/月区间；否则日均会按文件中最早/最晚 cancel 日期计算。")
-selected_range = st.date_input(
-    "选择报告统计日期区间（默认使用文件里的最小/最大取消日期）",
-    value=(min_date, max_date),
+metric_col = "Units" if metric_mode == "quantity" else "SKU Rows"
+metric_label = "按 Quantity 汇总" if metric_mode == "quantity" else "按 SKU 行数汇总"
+style_breakdown = make_breakdown(cancel_lines, "Nail Style", top_n=top_n, metric_label=metric_col)
+product_breakdown = make_breakdown(cancel_lines, "Product Link / Product Name", top_n=top_n, metric_label=metric_col)
+reason_df = value_count_table(cancel_orders, "Cancel Reason Clean", len(cancel_orders), top_n=top_n)
+
+created_hour_counts = hourly_counts_from_series(cancel_orders["Created Datetime"] if not cancel_orders.empty else pd.Series(dtype="datetime64[ns]"))
+cancelled_hour_counts = hourly_counts_from_series(cancel_orders["Cancelled Datetime"] if not cancel_orders.empty else pd.Series(dtype="datetime64[ns]"))
+created_peak_label, created_peak_val = peak_label(created_hour_counts)
+cancelled_peak_label, cancelled_peak_val = peak_label(cancelled_hour_counts)
+
+live1_cancel = int((cancel_orders["Live Segment by Created Time"] == "直播①").sum()) if not cancel_orders.empty else 0
+live2_cancel = int((cancel_orders["Live Segment by Created Time"] == "直播②").sum()) if not cancel_orders.empty else 0
+live_cancel = live1_cancel + live2_cancel
+nonlive_cancel = len(cancel_orders) - live_cancel
+
+live1_all = int((all_orders["Live Segment by Created Time"] == "直播①").sum()) if not all_orders.empty else 0
+live2_all = int((all_orders["Live Segment by Created Time"] == "直播②").sum()) if not all_orders.empty else 0
+live_all = live1_all + live2_all
+nonlive_all = len(all_orders) - live_all
+live1_cancel_rate = pct(live1_cancel, live1_all)
+live2_cancel_rate = pct(live2_cancel, live2_all)
+live_cancel_rate = pct(live_cancel, live_all)
+nonlive_cancel_rate = pct(nonlive_cancel, nonlive_all)
+
+cancel_sku_metric = float(cancel_lines["Metric Units"].sum()) if not cancel_lines.empty else 0
+missing_cancelled_time = int(cancel_orders["Cancelled Datetime"].isna().sum()) if not cancel_orders.empty else 0
+
+range_label = f"{start_date.strftime('%Y/%m/%d')}–{end_date.strftime('%Y/%m/%d')}"
+ctx = {
+    "source_name": uploaded_file.name,
+    "report_title": f"{range_label} Cancelled Orders Report",
+    "range_label": range_label,
+    "total_orders": len(all_orders),
+    "cancel_orders": len(cancel_orders),
+    "cancel_rate": pct(len(cancel_orders), len(all_orders)),
+    "cancel_sku_metric": cancel_sku_metric,
+    "metric_label": metric_label,
+    "metric_col": metric_col,
+    "live1_start": int(live1_start),
+    "live1_end": int(live1_end),
+    "live2_start": int(live2_start),
+    "live2_end": int(live2_end),
+    "live1_cancel": live1_cancel,
+    "live2_cancel": live2_cancel,
+    "live_cancel": live_cancel,
+    "nonlive_cancel": nonlive_cancel,
+    "live1_all": live1_all,
+    "live2_all": live2_all,
+    "live_all": live_all,
+    "nonlive_all": nonlive_all,
+    "live1_cancel_rate": live1_cancel_rate,
+    "live2_cancel_rate": live2_cancel_rate,
+    "live_cancel_rate": live_cancel_rate,
+    "nonlive_cancel_rate": nonlive_cancel_rate,
+    "created_hour_counts": created_hour_counts,
+    "cancelled_hour_counts": cancelled_hour_counts,
+    "created_peak_label": created_peak_label,
+    "created_peak_val": created_peak_val,
+    "cancelled_peak_label": cancelled_peak_label,
+    "cancelled_peak_val": cancelled_peak_val,
+    "missing_cancelled_time": missing_cancelled_time,
+    "reason_df": reason_df,
+    "style_breakdown": style_breakdown,
+    "product_breakdown": product_breakdown,
+}
+ctx["insights"] = build_insights(
+    all_orders, cancel_orders, cancel_lines, style_breakdown, product_breakdown,
+    start_date, end_date, live1_start, live1_end, live2_start, live2_end,
 )
-if isinstance(selected_range, tuple) and len(selected_range) == 2:
-    start_date, end_date = selected_range
-else:
-    start_date, end_date = min_date, max_date
-
-if start_date > end_date:
-    st.error("开始日期不能晚于结束日期。")
-    st.stop()
-
-if not (0 <= live1_start < live1_end <= 24 and 0 <= live2_start < live2_end <= 24):
-    st.error("直播时段设置不合法：开始小时必须小于结束小时，且范围在 0–24 之间。")
-    st.stop()
-
-analysis_df = prepare_analysis(order_df, time_col, reason_col, start_date, end_date, live1_start, live1_end, live2_start, live2_end)
-
-# Recompute reason tables with selected top_n after context build.
-ctx = build_report_context(
-    analysis_df,
-    raw_rows=len(raw),
-    unique_orders_before_filter=order_df["Order ID"].nunique(),
-    source_name=uploaded_file.name,
-    start_date=start_date,
-    end_date=end_date,
-    live1_start=int(live1_start), live1_end=int(live1_end),
-    live2_start=int(live2_start), live2_end=int(live2_end),
-)
-ctx["weekday_reasons"] = reason_table(analysis_df[analysis_df["Day Type"] == "工作日 Weekday"], top_n)
-ctx["weekend_reasons"] = reason_table(analysis_df[analysis_df["Day Type"] == "周末 Weekend"], top_n)
-ctx["live1_reasons"] = reason_table(analysis_df[analysis_df["Live Segment"] == "直播①"], min(top_n, 7))
-ctx["live2_reasons"] = reason_table(analysis_df[analysis_df["Live Segment"] == "直播②"], min(top_n, 7))
-ctx["nonlive_reasons"] = reason_table(analysis_df[analysis_df["Live Segment"] == "非直播"], min(top_n, 7))
-
-if len(analysis_df) == 0:
-    st.warning("当前日期区间内没有可分析的 cancel 订单。")
-    st.stop()
-
-st.subheader("3）核心结果")
-a, b, c, d = st.columns(4)
-a.metric("原始 SKU 行数", f"{len(raw):,}")
-b.metric("去重 Order ID", f"{order_df['Order ID'].nunique():,}")
-c.metric("当前区间 Cancel", f"{len(analysis_df):,}")
-d.metric("直播时段占比", f"{ctx['live_pct']:.1f}%")
 
 html_report = build_html_report(ctx)
-excel_bytes = make_excel_download(order_df, analysis_df, ctx)
-file_stub = f"cancel_report_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}"
+excel_bytes = make_excel_download(all_orders, cancel_orders, cancel_lines, style_breakdown, product_breakdown, reason_df, ctx)
 
-st.download_button(
-    "⬇️ 下载 HTML Report",
-    data=html_report.encode("utf-8"),
-    file_name=f"{file_stub}.html",
-    mime="text/html",
-)
-st.download_button(
-    "⬇️ 下载清洗后的订单级 Excel",
-    data=excel_bytes,
-    file_name=f"{file_stub}_cleaned_orders.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-)
+# =========================
+# Display in Streamlit
+# =========================
+if missing_created:
+    st.warning(f"有 {missing_created:,} 行 Created Time 无法解析，已从日期筛选和报告中排除。")
 
-st.subheader("4）报告预览")
-st.caption("下面是最终 HTML 报告预览；下载 HTML 后可以直接发给团队或截图放进周报/月报。")
-components.html(html_report, height=2300, scrolling=True)
+st.subheader("核心结果")
+k1, k2, k3, k4, k5 = st.columns(5)
+k1.metric("Total Orders", fmt_num(len(all_orders)))
+k2.metric("Cancelled Orders", fmt_num(len(cancel_orders)))
+k3.metric("Cancel Rate", f"{ctx['cancel_rate']:.1f}%")
+k4.metric("Live-attributed Cancelled", fmt_num(live_cancel), help="按 Created Time 判断是否在直播时段创建")
+k5.metric("Cancelled SKU Units", fmt_num(cancel_sku_metric), help=metric_label)
 
-with st.expander("查看自动生成的关键洞察"):
-    for i, insight in enumerate(ctx["insights"], start=1):
-        st.markdown(f"**{i}.** {insight}", unsafe_allow_html=True)
+st.subheader("直播归因判断：按 Created Time")
+live_summary = pd.DataFrame([
+    ["直播①", live1_cancel, live1_all, live1_cancel_rate, fmt_pct(live1_cancel, len(cancel_orders))],
+    ["直播②", live2_cancel, live2_all, live2_cancel_rate, fmt_pct(live2_cancel, len(cancel_orders))],
+    ["直播合计", live_cancel, live_all, live_cancel_rate, fmt_pct(live_cancel, len(cancel_orders))],
+    ["非直播", nonlive_cancel, nonlive_all, nonlive_cancel_rate, fmt_pct(nonlive_cancel, len(cancel_orders))],
+], columns=["Segment", "Cancelled Orders", "Total Created Orders in Segment", "Segment Cancel Rate", "% of Cancelled Orders"])
+st.dataframe(live_summary, use_container_width=True, hide_index=True)
 
-if show_cleaned:
-    st.subheader("5）订单级明细预览")
-    preview_cols = [c for c in ["Order ID", "Cancelled Datetime", "Cancel Reason", "Cancel Reason Clean", "Day Type", "Live Segment", "Hour", "SKU Count", "Item Quantity", "Seller SKU", "Variation", "Order Amount Parsed", "Order Refund Amount Parsed", "Payment Method", "State", "Country"] if c in analysis_df.columns]
-    st.dataframe(analysis_df[preview_cols].sort_values("Cancelled Datetime" if "Cancelled Datetime" in preview_cols else preview_cols[0]), use_container_width=True, height=360)
+st.subheader("Breakdowns")
+tab1, tab2, tab3, tab4 = st.tabs(["Cancel Reasons", "甲型 / SKU", "H Column 产品链接", "订单级 Cancelled 明细"])
+with tab1:
+    st.dataframe(reason_df, use_container_width=True, hide_index=True)
+with tab2:
+    st.dataframe(style_breakdown, use_container_width=True, hide_index=True)
+with tab3:
+    st.dataframe(product_breakdown, use_container_width=True, hide_index=True)
+with tab4:
+    st.dataframe(cancel_orders, use_container_width=True, hide_index=True)
 
-st.caption("说明：直播时段只是“取消时间与直播时段重合”的分析，不等同于因果归因。建议结合直播间 GMV、订单量、曝光、主播话术和活动价变动一起判断。")
+st.subheader("HTML Report Preview")
+components.html(html_report, height=1100, scrolling=True)
+
+d1, d2 = st.columns(2)
+with d1:
+    st.download_button(
+        "下载 HTML Report",
+        data=html_report.encode("utf-8"),
+        file_name=f"cancelled_orders_report_{start_date}_{end_date}.html",
+        mime="text/html",
+        use_container_width=True,
+    )
+with d2:
+    st.download_button(
+        "下载清洗后 Excel",
+        data=excel_bytes,
+        file_name=f"cancelled_orders_cleaned_{start_date}_{end_date}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
