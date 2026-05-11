@@ -33,6 +33,7 @@ SIZE_TOKENS = {
     "XS", "S", "M", "L", "XL", "XXL", "XXXL",
     "EXTRA SMALL", "SMALL", "MEDIUM", "LARGE", "EXTRA LARGE",
 }
+AUCTION_SKUS = {"1", "2", "3"}
 
 RETURN_TARGET_PRODUCT_LINKS = [
     "Dreamwear",
@@ -1442,6 +1443,299 @@ def make_return_excel_download(ctx) -> bytes:
             sheet.set_column(1, 20, 18)
     return output.getvalue()
 
+def build_auction_html_report(ctx):
+    """Auction Orders HTML report — cancel + return metrics filtered to Seller SKU 1/2/3."""
+    auction_return_order_count = ctx.get("auction_return_order_count", 0)
+    auction_return_rate = ctx.get("auction_return_rate", 0.0)
+
+    cancel_insights = build_insights(
+        ctx.get("_auction_all_orders", pd.DataFrame()),
+        ctx.get("_auction_cancel_orders", pd.DataFrame()),
+        ctx.get("_auction_cancel_lines", pd.DataFrame()),
+        ctx.get("style_breakdown", pd.DataFrame()),
+        ctx.get("product_breakdown", pd.DataFrame()),
+        ctx.get("_start_date"), ctx.get("_end_date"),
+        ctx["live1_start"], ctx["live1_end"], ctx["live2_start"], ctx["live2_end"],
+    )
+    insights_html = "\n".join(
+        f'''<div class="insight"><div class="insight-icon">// {str(i).zfill(2)}</div><div>{txt}</div></div>'''
+        for i, txt in enumerate(cancel_insights, start=1)
+    )
+
+    if ctx.get("has_return_data"):
+        return_section_html = f'''
+  <div class="section">
+    <div class="section-label"><span>08</span>Auction Returned 包裹直播归因 · Based on Order Created Time</div>
+    <div class="stat-grid">
+      <div class="stat green"><div class="stat-lbl">Returned Packages</div><div class="stat-val green">{fmt_num(ctx['return_total_packages'])}</div><div class="stat-sub">按 Tracking / Return Order ID 去重</div></div>
+      <div class="stat purple"><div class="stat-lbl">直播时间 Created</div><div class="stat-val purple">{fmt_num(ctx['return_live_packages'])}</div><div class="stat-sub">占 returned packages {fmt_pct(ctx['return_live_packages'], ctx['return_total_packages'])}</div></div>
+      <div class="stat blue"><div class="stat-lbl">非直播 Created</div><div class="stat-val blue">{fmt_num(ctx['return_nonlive_packages'])}</div><div class="stat-sub">Created Time 不在直播时段</div></div>
+      <div class="stat amber"><div class="stat-lbl">Created Time Unknown</div><div class="stat-val amber">{fmt_num(ctx['return_unknown_packages'])}</div><div class="stat-sub">未能从订单总表匹配</div></div>
+    </div>
+    <div class="full-panel" style="margin-top:16px">
+      <div class="panel-title">Returned package segment breakdown <span class="badge y">Return 表中属于 Auction 的订单</span></div>
+      {make_return_segment_rows(ctx.get('return_segment_summary'), 'var(--purple)')}
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-label"><span>09</span>Auction Returned Orders · 核心指标</div>
+    <div class="stat-grid">
+      <div class="stat red"><div class="stat-lbl">Seller Fault</div><div class="stat-val red">{fmt_num(ctx['return_seller_fault_packages'])}</div><div class="stat-sub">Return Reason ≠ No Longer Needed · {fmt_pct(ctx['return_seller_fault_packages'], ctx['return_total_packages'])}</div></div>
+      <div class="stat amber"><div class="stat-lbl">Request Cancelled</div><div class="stat-val amber">{fmt_num(ctx['return_request_cancelled_packages'])}</div><div class="stat-sub">S column · {fmt_pct(ctx['return_request_cancelled_packages'], ctx['return_total_packages'])}</div></div>
+      <div class="stat green"><div class="stat-lbl">已寄出退回包裹</div><div class="stat-val green">{fmt_num(ctx['return_shipped_packages'])}</div><div class="stat-sub">Q column tracking 有记录 · {fmt_pct(ctx['return_shipped_packages'], ctx['return_total_packages'])}</div></div>
+      <div class="stat blue"><div class="stat-lbl">Refund Only</div><div class="stat-val blue">{fmt_num(ctx['return_refund_only_packages'])}</div><div class="stat-sub">L column Return Type · {fmt_pct(ctx['return_refund_only_packages'], ctx['return_total_packages'])}</div></div>
+    </div>
+    <div class="two-col" style="margin-top:16px">
+      <div class="panel">
+        <div class="panel-title">Return Reason 占比 <span class="badge r">N column</span></div>
+        {make_reason_rows(ctx.get('return_reason_df').rename(columns={{'Returned Packages':'Order Count'}}), 'var(--live1)')}
+      </div>
+      <div class="panel">
+        <div class="panel-title">Seller Fault 归因 <span class="badge y">非 No Longer Needed</span></div>
+        {make_reason_rows(ctx.get('return_fault_df').rename(columns={{'Returned Packages':'Order Count'}}), 'var(--live2)')}
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-label"><span>10</span>Auction Returned Orders · SKU / 款式 Breakdown</div>
+    <div class="two-col">
+      <div class="panel">
+        <div class="panel-title">退货 SKU Top10 <span class="badge b">H column Seller SKU → 款式英文名</span></div>
+        {make_breakdown_rows(ctx['return_sku_breakdown'], 'Return Style English (Catalog)', 'Returned Units', 'var(--nonlive)')}
+      </div>
+      <div class="panel">
+        <div class="panel-title">退货款式 <span class="badge r">J column SKU Name</span></div>
+        {make_breakdown_rows(ctx['return_style_breakdown'], 'Return Style (J SKU Name)', 'Returned Units', 'var(--live1)')}
+      </div>
+    </div>
+    <div class="two-col" style="margin-top:16px">
+      <div class="panel">
+        <div class="panel-title">Return Type <span class="badge y">L column</span></div>
+        {make_reason_rows(ctx.get('return_type_df').rename(columns={{'Returned Packages':'Order Count'}}), 'var(--live2)')}
+      </div>
+      <div class="panel">
+        <div class="panel-title">Return Sub Status <span class="badge b">S column</span></div>
+        {make_reason_rows(ctx.get('return_status_df').rename(columns={{'Returned Packages':'Order Count'}}), 'var(--nonlive)')}
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-label"><span>11</span>Auction Returned Orders · 产品链接 Breakdown</div>
+    <div class="two-col">
+      <div class="panel">
+        <div class="panel-title">Top5 高退货产品链接 <span class="badge b">I column Product Name</span></div>
+        {make_breakdown_rows(ctx['return_product_link_top5'], 'Return Product Link (I Product Name)', 'Returned Units', 'var(--nonlive)')}
+      </div>
+      <div class="panel">
+        <div class="panel-title">指定产品链接退货占比 <span class="badge r">按 Return Quantity</span></div>
+        {make_breakdown_rows(ctx['return_product_link_targets'], 'Product Link', 'Returned Units', 'var(--live1)')}
+      </div>
+    </div>
+  </div>
+'''
+        insight_section_no = "12"
+    else:
+        return_section_html = ""
+        insight_section_no = "08"
+
+    created_max = max(5, int(np.ceil(max(ctx["created_hour_counts"] + [1]) / 5.0) * 5))
+    cancelled_max = max(5, int(np.ceil(max(ctx["cancelled_hour_counts"] + [1]) / 5.0) * 5))
+
+    html_doc = f'''<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{html.escape(ctx['report_title'])}</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<style>
+  :root {{
+    --bg:#f7f7f5; --surface:#ffffff; --surface2:#f0f0ed; --border:rgba(0,0,0,0.08);
+    --text:#1a1a18; --text-muted:#5a5c63; --text-dim:#9a9ca3;
+    --live1:#d44a1e; --live2:#c8840a; --nonlive:#2d5fa8; --accent:#c8840a; --green:#2a9e62; --purple:#7a4cc2;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans SC","Microsoft YaHei",Arial,sans-serif;
+    --display:Georgia,"Times New Roman",serif;
+  }}
+  * {{ margin:0; padding:0; box-sizing:border-box; }}
+  body {{ background:var(--bg); color:var(--text); font-family:var(--sans); font-weight:300; line-height:1.6; min-height:100vh; }}
+  header {{ border-bottom:1px solid var(--border); padding:48px 60px 40px; position:relative; overflow:hidden; }}
+  header::before {{ content:''; position:absolute; top:-80px; right:-80px; width:400px; height:400px; background:radial-gradient(circle,rgba(200,132,10,0.10) 0%,transparent 70%); pointer-events:none; }}
+  .header-tag {{ font-family:var(--mono); font-size:11px; color:var(--accent); letter-spacing:.15em; text-transform:uppercase; margin-bottom:14px; }}
+  h1 {{ font-family:var(--display); font-size:48px; font-weight:700; line-height:1.15; color:var(--text); margin-bottom:10px; }}
+  .header-sub {{ font-size:14px; color:var(--text-muted); letter-spacing:.02em; }}
+  .header-meta {{ position:absolute; top:48px; right:60px; text-align:right; font-family:var(--mono); font-size:11px; color:var(--text-dim); line-height:2; }}
+  .header-meta strong {{ display:block; font-size:28px; color:var(--text); font-weight:500; letter-spacing:-.02em; }}
+  main {{ padding:0 60px 80px; }}
+  .section {{ margin-top:56px; animation:fadeUp .5s ease both; }}
+  .section-label {{ font-family:var(--mono); font-size:10px; letter-spacing:.18em; text-transform:uppercase; color:var(--text-dim); margin-bottom:18px; padding-bottom:10px; border-bottom:1px solid var(--border); }}
+  .section-label span {{ color:var(--accent); margin-right:8px; }}
+  .stat-grid {{ display:grid; grid-template-columns:repeat(4,1fr); gap:1px; background:var(--border); border:1px solid var(--border); border-radius:8px; overflow:hidden; }}
+  .stat {{ background:var(--surface); padding:24px 22px; position:relative; }}
+  .stat::after {{ content:''; position:absolute; bottom:0; left:22px; right:22px; height:2px; border-radius:2px; }}
+  .stat.red::after {{ background:var(--live1); }} .stat.green::after {{ background:var(--green); }} .stat.blue::after {{ background:var(--nonlive); }} .stat.amber::after {{ background:var(--live2); }} .stat.purple::after {{ background:var(--purple); }}
+  .stat-lbl {{ font-family:var(--mono); font-size:10px; color:var(--text-muted); letter-spacing:.08em; margin-bottom:10px; }}
+  .stat-val {{ font-size:34px; font-weight:500; letter-spacing:-.03em; line-height:1; margin-bottom:6px; }}
+  .stat-val.red {{ color:var(--live1); }} .stat-val.green {{ color:var(--green); }} .stat-val.blue {{ color:#6b9ddb; }} .stat-val.amber {{ color:var(--live2); }} .stat-val.purple {{ color:var(--purple); }}
+  .stat-sub {{ font-size:12px; color:var(--text-dim); }}
+  .two-col {{ display:grid; grid-template-columns:1fr 1fr; gap:16px; }}
+  .panel,.full-panel {{ background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:24px; }}
+  .panel-title {{ font-family:var(--mono); font-size:11px; color:var(--text-muted); letter-spacing:.1em; margin-bottom:18px; display:flex; align-items:center; gap:10px; flex-wrap:wrap; }}
+  .badge {{ background:var(--surface2); border:1px solid var(--border); border-radius:4px; padding:2px 8px; font-size:10px; color:var(--text-dim); }}
+  .badge.r {{ border-color:rgba(232,87,42,.3); color:var(--live1); }} .badge.y {{ border-color:rgba(240,167,66,.3); color:var(--live2); }} .badge.b {{ border-color:rgba(45,95,168,.3); color:var(--nonlive); }}
+  .mini-stats {{ display:flex; gap:8px; margin-top:14px; }}
+  .mini-stat {{ flex:1; background:var(--surface2); border-radius:6px; padding:10px 12px; text-align:center; }}
+  .mini-stat-lbl {{ font-size:10px; color:var(--text-dim); margin-bottom:3px; }} .mini-stat-val {{ font-size:18px; font-weight:500; color:var(--text); }} .mini-stat-sub {{ font-size:10px; color:var(--text-dim); margin-top:2px; }}
+  .chart-wrap {{ position:relative; width:100%; }}
+  .legend {{ display:flex; gap:16px; margin-bottom:12px; flex-wrap:wrap; }}
+  .legend-item {{ display:flex; align-items:center; gap:6px; font-size:11px; color:var(--text-muted); }}
+  .legend-dot {{ width:10px; height:10px; border-radius:2px; flex-shrink:0; }}
+  .reason-row,.break-row {{ display:flex; align-items:center; gap:10px; padding:7px 0; border-bottom:1px solid var(--border); font-size:12px; }}
+  .reason-row:last-child,.break-row:last-child {{ border-bottom:none; }}
+  .reason-name,.break-name {{ flex:1; color:var(--text-muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
+  .reason-bar-wrap,.break-bar-wrap {{ width:86px; height:4px; background:var(--surface2); border-radius:2px; overflow:hidden; }}
+  .reason-bar,.break-bar {{ height:100%; border-radius:2px; }}
+  .reason-cnt,.break-num {{ font-family:var(--mono); font-size:11px; color:var(--text); min-width:38px; text-align:right; }}
+  .reason-pct,.break-pct {{ font-family:var(--mono); font-size:10px; color:var(--text-dim); min-width:42px; text-align:right; }}
+  .break-orders {{ font-family:var(--mono); font-size:10px; color:var(--text-dim); min-width:72px; text-align:right; }}
+  .insights {{ display:flex; flex-direction:column; gap:10px; }}
+  .insight {{ background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:16px 20px; font-size:13px; color:var(--text-muted); line-height:1.7; display:flex; gap:14px; align-items:flex-start; }}
+  .insight-icon {{ font-family:var(--mono); font-size:10px; color:var(--accent); letter-spacing:.05em; flex-shrink:0; padding-top:3px; }}
+  .insight strong {{ color:var(--text); font-weight:500; }}
+  footer {{ border-top:1px solid var(--border); margin:0 60px; padding:24px 0; font-family:var(--mono); font-size:10px; color:var(--text-dim); display:flex; justify-content:space-between; gap:16px; }}
+  .empty-note {{ font-size:12px; color:var(--text-dim); padding:12px 0; }}
+  @keyframes fadeUp {{ from {{ opacity:0; transform:translateY(16px); }} to {{ opacity:1; transform:translateY(0); }} }}
+</style>
+</head>
+<body>
+<header>
+  <div class="header-tag">Auction Order Analytics · {html.escape(ctx['range_label'])}</div>
+  <h1>Auction Orders<br>竞拍订单分析报告</h1>
+  <p class="header-sub">Seller SKU = 1 / 2 / 3 · Cancel + Return 各项指标 · Created Time 直播归因</p>
+  <div class="header-meta">
+    <strong>{fmt_num(ctx['total_orders'])}</strong>
+    Auction Total Orders<br>
+    Cancel Rate {ctx['cancel_rate']:.1f}% · Return Rate {auction_return_rate:.1f}%
+  </div>
+</header>
+<main>
+  <div class="section">
+    <div class="section-label"><span>01</span>Auction 总览 Overview · Seller SKU = 1 / 2 / 3</div>
+    <div class="stat-grid">
+      <div class="stat green"><div class="stat-lbl">Auction Total Orders</div><div class="stat-val green">{fmt_num(ctx['total_orders'])}</div><div class="stat-sub">Seller SKU 1/2/3 · 按 Order ID 去重</div></div>
+      <div class="stat red"><div class="stat-lbl">Cancelled Orders</div><div class="stat-val red">{fmt_num(ctx['cancel_orders'])}</div><div class="stat-sub">Cancel Rate {ctx['cancel_rate']:.1f}%</div></div>
+      <div class="stat amber"><div class="stat-lbl">申请退货 Orders</div><div class="stat-val amber">{fmt_num(auction_return_order_count)}</div><div class="stat-sub">在 Return 表中的 Auction Order 数</div></div>
+      <div class="stat purple"><div class="stat-lbl">Auction 退货率</div><div class="stat-val purple">{auction_return_rate:.1f}%</div><div class="stat-sub">申请退货 Orders / Auction Total Orders</div></div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-label"><span>02</span>直播购买归因 · Based on Created Time</div>
+    <div class="stat-grid">
+      <div class="stat red"><div class="stat-lbl">直播① Cancelled</div><div class="stat-val red">{fmt_num(ctx['live1_cancel'])}</div><div class="stat-sub">{ctx['live1_start']}:00–{ctx['live1_end']}:00 · 占 cancelled {fmt_pct(ctx['live1_cancel'], ctx['cancel_orders'])}</div></div>
+      <div class="stat amber"><div class="stat-lbl">直播② Cancelled</div><div class="stat-val amber">{fmt_num(ctx['live2_cancel'])}</div><div class="stat-sub">{ctx['live2_start']}:00–{ctx['live2_end']}:00 · 占 cancelled {fmt_pct(ctx['live2_cancel'], ctx['cancel_orders'])}</div></div>
+      <div class="stat blue"><div class="stat-lbl">非直播 Cancelled</div><div class="stat-val blue">{fmt_num(ctx['nonlive_cancel'])}</div><div class="stat-sub">Created Time 不在直播时段</div></div>
+      <div class="stat purple"><div class="stat-lbl">直播创建订单 Cancel Rate</div><div class="stat-val purple">{ctx['live_cancel_rate']:.1f}%</div><div class="stat-sub">非直播 {ctx['nonlive_cancel_rate']:.1f}%</div></div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-label"><span>03</span>Created Time vs Cancelled Time · 每小时分布</div>
+    <div class="two-col">
+      <div class="panel">
+        <div class="panel-title">Auction Cancelled Orders 的创建时间 <span class="badge r">用于直播归因</span></div>
+        <div class="legend"><div class="legend-item"><div class="legend-dot" style="background:var(--live1)"></div>直播①</div><div class="legend-item"><div class="legend-dot" style="background:var(--live2)"></div>直播②</div><div class="legend-item"><div class="legend-dot" style="background:var(--nonlive)"></div>非直播</div></div>
+        <div class="chart-wrap" style="height:210px"><canvas id="createdHour"></canvas></div>
+        <div class="mini-stats"><div class="mini-stat"><div class="mini-stat-lbl">创建峰值</div><div class="mini-stat-val" style="color:var(--live1)">{ctx['created_peak_label']}</div><div class="mini-stat-sub">{fmt_num(ctx['created_peak_val'])}单</div></div><div class="mini-stat"><div class="mini-stat-lbl">直播归因占比</div><div class="mini-stat-val">{fmt_pct(ctx['live_cancel'], ctx['cancel_orders'])}</div><div class="mini-stat-sub">按 Created Time</div></div></div>
+      </div>
+      <div class="panel">
+        <div class="panel-title">实际取消时间 <span class="badge b">仅看 Cancelled Time 峰值</span></div>
+        <div class="chart-wrap" style="height:210px"><canvas id="cancelledHour"></canvas></div>
+        <div class="mini-stats"><div class="mini-stat"><div class="mini-stat-lbl">取消峰值</div><div class="mini-stat-val" style="color:var(--nonlive)">{ctx['cancelled_peak_label']}</div><div class="mini-stat-sub">{fmt_num(ctx['cancelled_peak_val'])}单</div></div><div class="mini-stat"><div class="mini-stat-lbl">缺失 Cancelled Time</div><div class="mini-stat-val">{fmt_num(ctx['missing_cancelled_time'])}</div><div class="mini-stat-sub">不进入右图</div></div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-label"><span>04</span>取消原因 Cancel Reason</div>
+    <div class="full-panel">
+      {make_reason_rows(ctx['reason_df'], 'var(--live1)')}
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-label"><span>05</span>Auction Cancelled Orders · 甲型 / SKU Breakdown</div>
+    <div class="full-panel">
+      <div class="panel-title">各个甲型个数和占比 <span class="badge r">{html.escape(ctx['metric_label'])}</span></div>
+      {make_breakdown_rows(ctx['style_breakdown'], 'Nail Style', ctx['metric_col'], 'var(--live1)')}
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-label"><span>06</span>Auction Cancelled Orders · H Column 产品链接 Breakdown</div>
+    <div class="full-panel">
+      <div class="panel-title">各个产品链接 / Product Name 个数和占比 <span class="badge b">H column</span></div>
+      {make_breakdown_rows(ctx['product_breakdown'], 'Product Link / Product Name', ctx['metric_col'], 'var(--nonlive)')}
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-label"><span>07</span>Auction Cancel SKU Units · 按 Quantity / SKU 行数</div>
+    <div class="stat-grid">
+      <div class="stat blue"><div class="stat-lbl">Cancelled SKU Units</div><div class="stat-val blue">{fmt_num(ctx['cancel_sku_metric'])}</div><div class="stat-sub">{html.escape(ctx['metric_label'])}</div></div>
+      <div class="stat green"><div class="stat-lbl">Auction Total Orders</div><div class="stat-val green">{fmt_num(ctx['total_orders'])}</div><div class="stat-sub">Seller SKU 1 / 2 / 3</div></div>
+      <div class="stat red"><div class="stat-lbl">Cancel Rate</div><div class="stat-val red">{ctx['cancel_rate']:.1f}%</div><div class="stat-sub">Cancelled / Total Auction Orders</div></div>
+      <div class="stat amber"><div class="stat-lbl">Return Rate (by Order)</div><div class="stat-val amber">{auction_return_rate:.1f}%</div><div class="stat-sub">申请退货 Orders / Total Auction Orders</div></div>
+    </div>
+  </div>
+
+  {return_section_html}
+
+  <div class="section">
+    <div class="section-label"><span>{insight_section_no}</span>关键洞察 Key Insights</div>
+    <div class="insights">{insights_html}</div>
+  </div>
+</main>
+<footer>
+  <span>数据来源：{html.escape(ctx['source_name'])} · Auction 口径：Seller SKU = 1 / 2 / 3 · 按 Order ID 去重</span>
+  <span>直播归因：Created Time in {ctx['live1_start']}:00–{ctx['live1_end']}:00 / {ctx['live2_start']}:00–{ctx['live2_end']}:00</span>
+</footer>
+<script>
+const C = Chart;
+const hrs = Array.from({{length:24}},(_,i)=>i);
+function barColor(h){{
+  if(h>={ctx['live1_start']} && h<{ctx['live1_end']}) return '#d44a1e';
+  if(h>={ctx['live2_start']} && h<{ctx['live2_end']}) return '#c8840a';
+  return '#2d5fa8';
+}}
+const colors = hrs.map(barColor);
+function commonOpts(maxVal, step){{
+  return {{ responsive:true, maintainAspectRatio:false, plugins:{{ legend:{{display:false}} }},
+    scales:{{
+      x:{{ ticks:{{autoSkip:false,maxRotation:0,font:{{size:9}},color:'#9a9ca3'}}, grid:{{color:'rgba(0,0,0,0.05)'}}, border:{{color:'rgba(0,0,0,0.08)'}} }},
+      y:{{ beginAtZero:true, max:maxVal, ticks:{{stepSize:step,font:{{size:10}},color:'#9a9ca3'}}, grid:{{color:'rgba(0,0,0,0.05)'}}, border:{{color:'rgba(0,0,0,0.08)'}} }}
+    }}
+  }};
+}}
+new C(document.getElementById('createdHour'), {{
+  type:'bar',
+  data:{{ labels:hrs.map(h=>h+'h'), datasets:[{{ data:{json.dumps(ctx['created_hour_counts'])}, backgroundColor:colors, borderRadius:3 }}] }},
+  options:commonOpts({created_max}, {5 if created_max >= 10 else 1})
+}});
+new C(document.getElementById('cancelledHour'), {{
+  type:'bar',
+  data:{{ labels:hrs.map(h=>h+'h'), datasets:[{{ data:{json.dumps(ctx['cancelled_hour_counts'])}, backgroundColor:'#2d5fa8', borderRadius:3 }}] }},
+  options:commonOpts({cancelled_max}, {5 if cancelled_max >= 10 else 1})
+}});
+</script>
+</body>
+</html>'''
+    return html_doc
+
+
 # =========================
 # Streamlit UI
 # =========================
@@ -1649,6 +1943,94 @@ if returned_file is not None:
     except Exception as e:
         st.error(f"Returned Order 表读取/分析失败：{e}")
 
+# =========================
+# Auction order analysis (Seller SKU = 1 / 2 / 3)
+# =========================
+auction_lines = selected_lines[
+    selected_lines["Seller SKU"].apply(lambda x: normalize_text(x, default="").strip()).isin(AUCTION_SKUS)
+].copy()
+
+auction_all_orders = build_order_level(auction_lines, live1_start, live1_end, live2_start, live2_end) if not auction_lines.empty else pd.DataFrame()
+auction_cancel_orders = auction_all_orders[auction_all_orders["Is Cancelled"]].copy() if not auction_all_orders.empty else pd.DataFrame()
+auction_cancel_order_ids = set(auction_cancel_orders["Order ID"]) if not auction_cancel_orders.empty else set()
+auction_cancel_lines = auction_lines[auction_lines["Order ID"].isin(auction_cancel_order_ids)].copy()
+auction_order_ids = set(auction_all_orders["Order ID"]) if not auction_all_orders.empty else set()
+
+auction_total_orders = len(auction_all_orders)
+auction_cancelled_count = len(auction_cancel_orders)
+auction_cancel_rate = pct(auction_cancelled_count, auction_total_orders)
+auction_cancel_sku_metric = float(auction_cancel_lines["Metric Units"].sum()) if not auction_cancel_lines.empty else 0
+auction_missing_cancelled_time = int(auction_cancel_orders["Cancelled Datetime"].isna().sum()) if not auction_cancel_orders.empty else 0
+
+auction_live1_cancel = int((auction_cancel_orders["Live Segment by Created Time"] == "直播①").sum()) if not auction_cancel_orders.empty else 0
+auction_live2_cancel = int((auction_cancel_orders["Live Segment by Created Time"] == "直播②").sum()) if not auction_cancel_orders.empty else 0
+auction_live_cancel = auction_live1_cancel + auction_live2_cancel
+auction_nonlive_cancel = auction_cancelled_count - auction_live_cancel
+auction_live1_all = int((auction_all_orders["Live Segment by Created Time"] == "直播①").sum()) if not auction_all_orders.empty else 0
+auction_live2_all = int((auction_all_orders["Live Segment by Created Time"] == "直播②").sum()) if not auction_all_orders.empty else 0
+auction_live_all = auction_live1_all + auction_live2_all
+auction_nonlive_all = auction_total_orders - auction_live_all
+auction_live1_cancel_rate = pct(auction_live1_cancel, auction_live1_all)
+auction_live2_cancel_rate = pct(auction_live2_cancel, auction_live2_all)
+auction_live_cancel_rate = pct(auction_live_cancel, auction_live_all)
+auction_nonlive_cancel_rate = pct(auction_nonlive_cancel, auction_nonlive_all)
+
+auction_created_hour_counts = hourly_counts_from_series(auction_cancel_orders["Created Datetime"] if not auction_cancel_orders.empty else pd.Series(dtype="datetime64[ns]"))
+auction_cancelled_hour_counts = hourly_counts_from_series(auction_cancel_orders["Cancelled Datetime"] if not auction_cancel_orders.empty else pd.Series(dtype="datetime64[ns]"))
+auction_created_peak_label, auction_created_peak_val = peak_label(auction_created_hour_counts)
+auction_cancelled_peak_label, auction_cancelled_peak_val = peak_label(auction_cancelled_hour_counts)
+
+auction_reason_df = value_count_table(auction_cancel_orders, "Cancel Reason Clean", auction_cancelled_count, top_n=top_n)
+auction_style_breakdown = make_breakdown(auction_cancel_lines, "Nail Style", top_n=top_n, metric_label=metric_col)
+auction_product_breakdown = make_breakdown(auction_cancel_lines, "Product Link / Product Name", top_n=top_n, metric_label=metric_col)
+
+# Auction return metrics — filter existing return data to auction order IDs
+auction_has_return_data = False
+auction_return_lines_df = pd.DataFrame()
+auction_return_packages_df = pd.DataFrame()
+auction_return_segment_summary = pd.DataFrame()
+auction_return_reason_df = pd.DataFrame()
+auction_return_sku_breakdown = pd.DataFrame()
+auction_return_style_breakdown = pd.DataFrame()
+auction_return_product_link_top5 = pd.DataFrame()
+auction_return_product_link_targets = pd.DataFrame()
+auction_return_type_df = pd.DataFrame()
+auction_return_status_df = pd.DataFrame()
+auction_return_fault_df = pd.DataFrame()
+auction_return_boolean_summary = pd.DataFrame()
+auction_return_total_packages = auction_return_live_packages = auction_return_nonlive_packages = auction_return_unknown_packages = 0
+auction_return_seller_fault = auction_return_request_cancelled = auction_return_shipped = auction_return_refund_only = 0
+auction_return_order_count = 0
+auction_return_rate = 0.0
+
+if has_return_data and not return_lines_df.empty and auction_order_ids:
+    auction_return_lines_df = return_lines_df[return_lines_df["Order ID"].isin(auction_order_ids)].copy()
+    if not auction_return_lines_df.empty:
+        auction_has_return_data = True
+        auction_return_order_count = int(auction_return_lines_df["Order ID"].nunique())
+        auction_return_rate = pct(auction_return_order_count, auction_total_orders)
+        auction_return_packages_df = finalize_return_package_segments(
+            build_return_package_level(auction_return_lines_df), live1_start, live1_end, live2_start, live2_end
+        )
+        auction_return_segment_summary = make_return_segment_summary(auction_return_packages_df)
+        auction_return_total_packages = len(auction_return_packages_df)
+        auction_return_live_packages = int(auction_return_packages_df["Is Live by Created Time"].sum()) if auction_return_total_packages else 0
+        auction_return_unknown_packages = int((auction_return_packages_df["Live Segment by Created Time"] == "Unknown").sum()) if auction_return_total_packages else 0
+        auction_return_nonlive_packages = auction_return_total_packages - auction_return_live_packages - auction_return_unknown_packages
+        auction_return_reason_df = make_return_package_count_table(auction_return_packages_df, "Return Reason", top_n=top_n)
+        auction_return_fault_df = make_return_package_count_table(auction_return_packages_df, "Return Reason Attribution", top_n=top_n)
+        auction_return_type_df = make_return_package_count_table(auction_return_packages_df, "Return Type", top_n=top_n)
+        auction_return_status_df = make_return_package_count_table(auction_return_packages_df, "Return Sub Status", top_n=top_n)
+        auction_return_sku_breakdown = make_return_line_breakdown(auction_return_lines_df, "Return Style English (Catalog)", top_n=10)
+        auction_return_style_breakdown = make_return_line_breakdown(auction_return_lines_df, "Return Style (J SKU Name)", top_n=top_n)
+        auction_return_product_link_top5 = make_return_line_breakdown(auction_return_lines_df, "Return Product Link (I Product Name)", top_n=5)
+        auction_return_product_link_targets = make_return_specific_product_link_share(auction_return_lines_df)
+        auction_return_boolean_summary = make_return_boolean_summary(auction_return_packages_df)
+        auction_return_seller_fault = int(auction_return_packages_df["Seller Fault Flag"].sum()) if auction_return_total_packages else 0
+        auction_return_request_cancelled = int(auction_return_packages_df["Request Cancelled Flag"].sum()) if auction_return_total_packages else 0
+        auction_return_shipped = int(auction_return_packages_df["Has Return Tracking Flag"].sum()) if auction_return_total_packages else 0
+        auction_return_refund_only = int(auction_return_packages_df["Refund Only Flag"].sum()) if auction_return_total_packages else 0
+
 range_label = f"{start_date.strftime('%Y/%m/%d')}–{end_date.strftime('%Y/%m/%d')}"
 ctx = {
     "source_name": uploaded_file.name,
@@ -1730,6 +2112,79 @@ if has_return_data:
     returned_html_report = build_return_html_report(ctx)
     returned_excel_bytes = make_return_excel_download(ctx)
 
+auction_ctx = {
+    "source_name": uploaded_file.name,
+    "report_title": f"{range_label} Auction Orders Report",
+    "range_label": range_label,
+    "total_orders": auction_total_orders,
+    "cancel_orders": auction_cancelled_count,
+    "cancel_rate": auction_cancel_rate,
+    "cancel_sku_metric": auction_cancel_sku_metric,
+    "metric_label": metric_label,
+    "metric_col": metric_col,
+    "live1_start": int(live1_start),
+    "live1_end": int(live1_end),
+    "live2_start": int(live2_start),
+    "live2_end": int(live2_end),
+    "live1_cancel": auction_live1_cancel,
+    "live2_cancel": auction_live2_cancel,
+    "live_cancel": auction_live_cancel,
+    "nonlive_cancel": auction_nonlive_cancel,
+    "live1_all": auction_live1_all,
+    "live2_all": auction_live2_all,
+    "live_all": auction_live_all,
+    "nonlive_all": auction_nonlive_all,
+    "live1_cancel_rate": auction_live1_cancel_rate,
+    "live2_cancel_rate": auction_live2_cancel_rate,
+    "live_cancel_rate": auction_live_cancel_rate,
+    "nonlive_cancel_rate": auction_nonlive_cancel_rate,
+    "created_hour_counts": auction_created_hour_counts,
+    "cancelled_hour_counts": auction_cancelled_hour_counts,
+    "created_peak_label": auction_created_peak_label,
+    "created_peak_val": auction_created_peak_val,
+    "cancelled_peak_label": auction_cancelled_peak_label,
+    "cancelled_peak_val": auction_cancelled_peak_val,
+    "missing_cancelled_time": auction_missing_cancelled_time,
+    "reason_df": auction_reason_df,
+    "style_breakdown": auction_style_breakdown,
+    "product_breakdown": auction_product_breakdown,
+    "has_return_data": auction_has_return_data,
+    "return_file_name": return_file_name if has_return_data else "",
+    "return_total_packages": auction_return_total_packages,
+    "return_live_packages": auction_return_live_packages,
+    "return_nonlive_packages": auction_return_nonlive_packages,
+    "return_unknown_packages": auction_return_unknown_packages,
+    "return_segment_summary": auction_return_segment_summary,
+    "return_reason_df": auction_return_reason_df,
+    "return_sku_breakdown": auction_return_sku_breakdown,
+    "return_style_breakdown": auction_return_style_breakdown,
+    "return_product_link_top5": auction_return_product_link_top5,
+    "return_product_link_targets": auction_return_product_link_targets,
+    "return_type_df": auction_return_type_df,
+    "return_status_df": auction_return_status_df,
+    "return_fault_df": auction_return_fault_df,
+    "return_boolean_summary": auction_return_boolean_summary,
+    "return_seller_fault_packages": auction_return_seller_fault,
+    "return_request_cancelled_packages": auction_return_request_cancelled,
+    "return_shipped_packages": auction_return_shipped,
+    "return_refund_only_packages": auction_return_refund_only,
+    "return_packages_df": auction_return_packages_df,
+    "return_lines_df": auction_return_lines_df,
+    "auction_return_order_count": auction_return_order_count,
+    "auction_return_rate": auction_return_rate,
+    # Private keys for insight builder inside build_auction_html_report
+    "_auction_all_orders": auction_all_orders,
+    "_auction_cancel_orders": auction_cancel_orders,
+    "_auction_cancel_lines": auction_cancel_lines,
+    "_start_date": start_date,
+    "_end_date": end_date,
+}
+auction_html_report = build_auction_html_report(auction_ctx)
+auction_excel_bytes = make_excel_download(
+    auction_all_orders, auction_cancel_orders, auction_cancel_lines,
+    auction_style_breakdown, auction_product_breakdown, auction_reason_df, auction_ctx,
+)
+
 # =========================
 # Display in Streamlit
 # =========================
@@ -1739,7 +2194,7 @@ if missing_created:
 st.subheader("报告输出")
 st.caption("Cancelled 和 Returned 已拆成两个独立报告；指标口径保持不变。")
 
-report_tabs = st.tabs(["Cancelled Report", "Returned Report"])
+report_tabs = st.tabs(["Cancelled Report", "Returned Report", "Auction Report"])
 
 with report_tabs[0]:
     st.subheader("Cancelled Orders 核心结果")
@@ -1857,6 +2312,103 @@ with report_tabs[1]:
                 "下载 Returned Excel",
                 data=returned_excel_bytes,
                 file_name=f"returned_orders_cleaned_{start_date}_{end_date}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+
+with report_tabs[2]:
+    st.subheader("Auction Orders 分析 · Seller SKU = 1 / 2 / 3")
+    st.caption("从订单总表中筛选 G column Seller SKU 为 1、2 或 3 的行，按 Order ID 去重分析。如已上传 Returned Order 表，退货指标将同步过滤到 auction 订单范围。")
+
+    if auction_total_orders == 0:
+        st.info("当前日期区间内未找到 Seller SKU 为 1/2/3 的 auction 订单。")
+    else:
+        st.markdown("### Auction 核心指标总览")
+        a1, a2, a3, a4 = st.columns(4)
+        a1.metric("Auction Total Orders", fmt_num(auction_total_orders), help="Seller SKU = 1/2/3，按 Order ID 去重")
+        a2.metric("Cancelled Orders", fmt_num(auction_cancelled_count), help=f"Cancel Rate {auction_cancel_rate:.1f}%")
+        a3.metric("Cancel Rate", f"{auction_cancel_rate:.1f}%")
+        a4.metric(
+            "申请退货 Orders",
+            fmt_num(auction_return_order_count),
+            help="Return 表中 Order ID 属于 auction 订单的去重数量" if auction_has_return_data else "需上传 Returned Order 表",
+        )
+
+        if auction_has_return_data:
+            a5, a6, a7, a8 = st.columns(4)
+            a5.metric("Auction 退货率", f"{auction_return_rate:.1f}%", help="申请退货 Orders / Auction Total Orders（按 Order ID）")
+            a6.metric("Returned Packages", fmt_num(auction_return_total_packages))
+            a7.metric("Seller Fault", fmt_num(auction_return_seller_fault))
+            a8.metric("Request Cancelled", fmt_num(auction_return_request_cancelled))
+        else:
+            st.info("上传 Returned Order 表后可显示退货率和退货详情。")
+
+        st.markdown("### 直播归因判断：按 Created Time")
+        auction_live_summary = pd.DataFrame([
+            ["直播①", auction_live1_cancel, auction_live1_all, auction_live1_cancel_rate, fmt_pct(auction_live1_cancel, auction_cancelled_count)],
+            ["直播②", auction_live2_cancel, auction_live2_all, auction_live2_cancel_rate, fmt_pct(auction_live2_cancel, auction_cancelled_count)],
+            ["直播合计", auction_live_cancel, auction_live_all, auction_live_cancel_rate, fmt_pct(auction_live_cancel, auction_cancelled_count)],
+            ["非直播", auction_nonlive_cancel, auction_nonlive_all, auction_nonlive_cancel_rate, fmt_pct(auction_nonlive_cancel, auction_cancelled_count)],
+        ], columns=["Segment", "Cancelled Orders", "Total Created Orders in Segment", "Segment Cancel Rate", "% of Cancelled Orders"])
+        st.dataframe(auction_live_summary, use_container_width=True, hide_index=True)
+
+        st.markdown("### Auction Cancelled Breakdowns")
+        act1, act2, act3, act4 = st.tabs(["Cancel Reasons", "甲型 / SKU", "H Column 产品链接", "Auction Cancelled 明细"])
+        with act1:
+            st.dataframe(display_table(auction_reason_df), use_container_width=True, hide_index=True)
+        with act2:
+            st.dataframe(display_table(auction_style_breakdown, drop_sku_row_count=True), use_container_width=True, hide_index=True)
+        with act3:
+            st.dataframe(display_table(auction_product_breakdown, drop_sku_row_count=True), use_container_width=True, hide_index=True)
+        with act4:
+            st.dataframe(auction_cancel_orders, use_container_width=True, hide_index=True)
+
+        if auction_has_return_data:
+            st.markdown("### Auction Returned Orders 核心指标")
+            ar1, ar2, ar3, ar4 = st.columns(4)
+            ar1.metric("Returned Packages", fmt_num(auction_return_total_packages))
+            ar2.metric("Created in Live Time", fmt_num(auction_return_live_packages))
+            ar3.metric("Live-created %", fmt_pct(auction_return_live_packages, auction_return_total_packages))
+            ar4.metric("Unknown Created Time", fmt_num(auction_return_unknown_packages))
+            st.dataframe(auction_return_segment_summary, use_container_width=True, hide_index=True)
+
+            art1, art2, art3, art4, art5, art6, art7 = st.tabs(["Return Reason", "Seller Fault", "退货 SKU Top10", "退货款式 J", "退货产品链接 I", "Return Type", "Return Package 明细"])
+            with art1:
+                st.dataframe(display_return_breakdown_table(auction_return_reason_df), use_container_width=True, hide_index=True)
+            with art2:
+                st.dataframe(display_return_breakdown_table(auction_return_fault_df), use_container_width=True, hide_index=True)
+            with art3:
+                st.dataframe(display_return_breakdown_table(auction_return_sku_breakdown), use_container_width=True, hide_index=True)
+            with art4:
+                st.dataframe(display_return_breakdown_table(auction_return_style_breakdown), use_container_width=True, hide_index=True)
+            with art5:
+                st.markdown("**Top5 高退货产品链接**")
+                st.dataframe(display_return_breakdown_table(auction_return_product_link_top5), use_container_width=True, hide_index=True)
+                st.markdown("**指定产品链接退货占比**")
+                st.dataframe(display_return_breakdown_table(auction_return_product_link_targets), use_container_width=True, hide_index=True)
+            with art6:
+                st.dataframe(display_return_breakdown_table(auction_return_type_df), use_container_width=True, hide_index=True)
+                st.dataframe(display_return_breakdown_table(auction_return_status_df), use_container_width=True, hide_index=True)
+            with art7:
+                st.dataframe(auction_return_packages_df, use_container_width=True, hide_index=True)
+
+        st.markdown("### Auction HTML Report Preview")
+        components.html(auction_html_report, height=950, scrolling=True)
+
+        ad1, ad2 = st.columns(2)
+        with ad1:
+            st.download_button(
+                "下载 Auction HTML Report",
+                data=auction_html_report.encode("utf-8"),
+                file_name=f"auction_orders_report_{start_date}_{end_date}.html",
+                mime="text/html",
+                use_container_width=True,
+            )
+        with ad2:
+            st.download_button(
+                "下载 Auction Excel",
+                data=auction_excel_bytes,
+                file_name=f"auction_orders_cleaned_{start_date}_{end_date}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
             )
