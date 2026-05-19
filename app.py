@@ -4,8 +4,9 @@ from io import BytesIO
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
-APP_VERSION = "COLLECTION_OPTIMIZED_20260515_PASTEABLE"
+APP_VERSION = "COLLECTION_OPTIMIZED_20260515_HTML_REPORT"
 CANCELLED = {"cancelled", "canceled"}
 SIZE_SUFFIX_RE = re.compile(r"[-_ ]?(XS|S|M|L|XL|XXL|XXXL)$", re.I)
 
@@ -902,6 +903,155 @@ def excel_bytes(sheets):
 
     return bio.getvalue()
 
+# ==============================
+# HTML Report Export
+# ==============================
+def html_escape(x):
+    import html
+    return html.escape("" if x is None else str(x))
+
+
+def _html_df(df, title=None, subtitle=None, max_rows=None):
+    if df is None or getattr(df, "empty", True):
+        body = '<div class="empty">No data available</div>'
+    else:
+        out = style_pct_df(df.copy())
+        if max_rows:
+            out = out.head(max_rows)
+        body = out.to_html(index=False, escape=True, classes="report-table", border=0)
+
+    title_html = f'<h3>{html_escape(title)}</h3>' if title else ""
+    subtitle_html = f'<p class="muted">{html_escape(subtitle)}</p>' if subtitle else ""
+    return f'<section class="panel">{title_html}{subtitle_html}{body}</section>'
+
+
+def html_metric_cards(items):
+    cards = []
+    for label, value, delta in items:
+        delta_html = f'<div class="delta">{html_escape(delta)}</div>' if delta else ""
+        cards.append(
+            f"""
+            <div class="metric-card">
+                <div class="metric-label">{html_escape(label)}</div>
+                <div class="metric-value">{html_escape(value)}</div>
+                {delta_html}
+            </div>
+            """
+        )
+    return '<div class="metric-grid">' + "".join(cards) + '</div>'
+
+
+def html_notes(notes):
+    if not notes:
+        return ""
+    return '<div class="notes">' + "".join(f'<p>{n}</p>' for n in notes) + '</div>'
+
+
+def build_html_report(cancel_ctx, return_ctx=None, auction_ctx=None, comp_df=None, channel_summary=None, insights=None, action_df=None, top_n=10):
+    generated_at = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")
+
+    cancelled_sections = f"""
+    <div class="section-title">01 · Cancelled Orders Report</div>
+    {html_metric_cards([
+        ("总 Order 数", f"{cancel_ctx['total_orders']:,}", None),
+        ("Cancelled 订单", f"{cancel_ctx['cancel_orders']:,}", f"Cancelled Rate {cancel_ctx['cancel_rate']:.2f}%"),
+        ("Cancelled Rate", f"{cancel_ctx['cancel_rate']:.2f}%", None),
+    ])}
+    <div class="two-col">
+        {_html_df(cancel_ctx.get('reason_df'), "Cancel Reasons", "按 Order ID 去重后的取消原因分布。", top_n)}
+        {_html_df(cancel_ctx.get('live_summary'), "Created Time 直播归因", "用订单总表 Created Time 判断是否直播时间下单。", None)}
+    </div>
+    {_html_df(cancel_ctx.get('sku_breakdown'), "Cancelled 甲型 / SKU Breakdown", "基于 cancelled orders 对应 SKU 行统计。", top_n)}
+    {_html_df(cancel_ctx.get('product_breakdown'), "Cancelled 产品链接 Breakdown", "基于 H/Product Name 产品链接统计。", top_n)}
+    {_html_df(cancel_ctx.get('collection_df'), "Cancelled Collection 链接", "按 Collection/Buy4/Toolkit/Organizer 归类后统计唯一 Order ID。", None)}
+    """
+
+    returned_sections = ""
+    if return_ctx:
+        returned_sections = f"""
+        <div class="section-title page-break">02 · Returned Orders Report</div>
+        {html_metric_cards([
+            ("Returned Packages", f"{return_ctx['returned_packages']:,}", None),
+            ("Created in Live Time", f"{return_ctx['live_created']:,}", f"{return_ctx['live_pct']:.2f}%"),
+            ("Unknown Created Time", f"{return_ctx['unknown_created']:,}", None),
+            ("Seller Fault", f"{return_ctx['seller_fault_n']:,}", f"{return_ctx['seller_fault_pct']:.2f}%"),
+            ("Request Cancelled", f"{return_ctx['request_cancelled_n']:,}", f"{return_ctx['request_cancelled_pct']:.2f}%"),
+            ("已寄出退回包裹", f"{return_ctx['shipped_back_n']:,}", f"{return_ctx['shipped_back_pct']:.2f}%"),
+            ("Refund Only", f"{return_ctx['refund_only_n']:,}", f"{return_ctx['refund_only_pct']:.2f}%"),
+        ])}
+        <div class="two-col">
+            {_html_df(return_ctx.get('reason_df'), "Return Reasons", "N column Return Reason 原因分布。", top_n)}
+            {_html_df(return_ctx.get('sku_top10'), "Top10 退货款式", "Seller SKU 去掉 -S/-M/-L 后匹配产品图册英文名。", top_n)}
+        </div>
+        {_html_df(return_ctx.get('product_top5'), "Top5 高退货产品链接", "基于 Returned 表 I column Product Name。", 5)}
+        {_html_df(return_ctx.get('target_link_df'), "指定链接退货占比", "Dreamwear / Top Trend / Next Gen / Buy 4 等指定关键词。", None)}
+        {_html_df(return_ctx.get('collection_df'), "Returned Collection 链接", "Returned 表 I column 带 Collection/Buy4/Toolkit/Organizer 的链接 SKU 行统计，分母为 Returned Excel 总行数。", None)}
+        """
+
+    auction_sections = ""
+    if auction_ctx:
+        auction_sections = f"""
+        <div class="section-title page-break">03 · Auction Orders Report</div>
+        {html_metric_cards([
+            ("总 Auction Order 数", f"{auction_ctx['total']:,}", None),
+            ("Cancelled 订单", f"{auction_ctx['cancelled_n']:,}", f"{pct(auction_ctx['cancelled_n'], auction_ctx['total']):.2f}%"),
+            ("申请退货（Return/Refund）", f"{auction_ctx['return_n']:,}", f"退货率 {auction_ctx['return_rate']:.2f}%"),
+            ("有效 Auction 平均 AOV", fmt_money(auction_ctx['valid_aov']), "排除 Cancelled"),
+            ("提交退货 Auction 平均 AOV", fmt_money(auction_ctx['return_aov']), None),
+            ("退货 AOV - 有效 AOV", fmt_money(auction_ctx['aov_diff']), None),
+        ])}
+        <div class="two-col">
+            {_html_df(auction_ctx.get('sku_dist'), "Auction SKU 分布", "G column Seller SKU 通常为 1 / 2 / 3。", None)}
+            {_html_df(auction_ctx.get('cancel_reason'), "Auction Cancel Reasons", "Auction 订单取消原因分布。", top_n)}
+        </div>
+        {_html_df(auction_ctx.get('return_reason'), "Auction Return Reasons", "通过 Order ID 对齐 Returned Order 表后的退货原因分布。", top_n)}
+        """
+
+    collection_sections = f"""
+    <div class="section-title page-break">04 · Collection 链接综合分析</div>
+    {_html_df(comp_df, "Collection 明细表", "合并 Returned Collection 和 Cancelled Collection 后的链接表现。", None)}
+    {_html_df(channel_summary, "汇总表（按渠道类型）", "达人带货 / 官号视频 / 直播间渠道小计。", None)}
+    <section class="panel">
+        <h3>启示</h3>
+        {html_notes(insights or [])}
+    </section>
+    {_html_df(action_df, "渠道动作建议表", "按渠道类型拆解核心问题和建议方向。", None)}
+    """
+
+    css = """
+    :root{--bg:#0f1117;--card:#171a22;--panel:#1f2330;--text:#f3f4f6;--muted:#a3aab8;--line:#343a46;--red:#ff4b4b;--green:#21a366;--blue:#5b8cff;}
+    *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.55;}
+    .wrap{max-width:1240px;margin:0 auto;padding:42px 34px 80px}.hero{padding:30px 0 22px;border-bottom:1px solid var(--line);margin-bottom:26px}.hero h1{font-size:38px;line-height:1.15;margin:0 0 10px;font-weight:800}.hero p{margin:0;color:var(--muted)}
+    .section-title{font-size:25px;font-weight:800;margin:34px 0 16px;padding-left:12px;border-left:5px solid var(--red)}.metric-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin:16px 0 22px}.metric-card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px 18px}.metric-label{color:var(--muted);font-size:14px;margin-bottom:8px}.metric-value{font-size:30px;font-weight:800}.delta{display:inline-block;margin-top:8px;background:rgba(33,163,102,.18);color:#71d891;padding:3px 9px;border-radius:999px;font-size:13px}
+    .two-col{display:grid;grid-template-columns:1fr 1fr;gap:16px}.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px;margin:16px 0}.panel h3{margin:0 0 6px;font-size:18px}.muted{color:var(--muted);margin:0 0 14px;font-size:14px}.empty{color:var(--muted);padding:18px;border:1px dashed var(--line);border-radius:12px}
+    table.report-table{width:100%;border-collapse:collapse;font-size:14px;overflow:hidden;border-radius:10px}table.report-table th{background:#2a2f3b;color:#e9edf5;text-align:left;font-weight:750}table.report-table th,table.report-table td{border:1px solid var(--line);padding:9px 10px;vertical-align:top}table.report-table tr:nth-child(even) td{background:rgba(255,255,255,.025)}.notes p{margin:0 0 14px}.notes strong{color:#fff}.footer{margin-top:34px;color:var(--muted);font-size:12px;border-top:1px solid var(--line);padding-top:18px}
+    @media(max-width:900px){.metric-grid{grid-template-columns:1fr 1fr}.two-col{grid-template-columns:1fr}.wrap{padding:24px 16px}.hero h1{font-size:28px}}@media print{body{background:#fff;color:#111}.panel,.metric-card{background:#fff;border-color:#ddd}.report-table th{background:#eee;color:#111}.page-break{page-break-before:always}.footer,.muted{color:#555}}
+    """
+
+    html_doc = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Cancelled + Returned + Auction Orders Report</title>
+<style>{css}</style>
+</head>
+<body>
+<div class="wrap">
+    <div class="hero">
+        <h1>💅 Cancelled + Returned + Auction Orders Report</h1>
+        <p>Generated at {html_escape(generated_at)} · Version {html_escape(APP_VERSION)} · 订单口径：Order ID unique；Returned SKU 口径：一行一个 SKU。</p>
+    </div>
+    {cancelled_sections}
+    {returned_sections}
+    {auction_sections}
+    {collection_sections}
+    <div class="footer">NailVesta Internal Report · HTML file generated by Streamlit app.</div>
+</div>
+</body>
+</html>"""
+    return html_doc
+
 
 st.title("💅 Cancelled + Returned + Auction Orders Report Generator")
 st.caption("上传 TikTok Shop 订单总表；可额外上传 Returned Order 表、产品图册、Auction 订单表。")
@@ -1376,9 +1526,34 @@ with tabs[idx]:
             ]
         )
 
-    st.download_button(
-        "下载 Excel Report",
-        data=excel_bytes(sheets),
-        file_name="cancel_return_auction_report.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    html_report = build_html_report(
+        cancel_ctx=cancel_ctx,
+        return_ctx=return_ctx,
+        auction_ctx=auction_ctx,
+        comp_df=comp_df,
+        channel_summary=channel_summary,
+        insights=insights,
+        action_df=action_df,
+        top_n=top_n,
     )
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.download_button(
+            "下载 Excel Report",
+            data=excel_bytes(sheets),
+            file_name="cancel_return_auction_report.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    with c2:
+        st.download_button(
+            "下载 HTML Report",
+            data=html_report.encode("utf-8"),
+            file_name="cancel_return_auction_report.html",
+            mime="text/html",
+        )
+
+    with st.expander("预览 HTML Report", expanded=False):
+        components.html(html_report, height=900, scrolling=True)
